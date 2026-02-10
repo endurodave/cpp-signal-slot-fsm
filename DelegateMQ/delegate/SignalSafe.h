@@ -32,6 +32,7 @@ namespace dmq {
     public:
         using BaseType = MulticastDelegateSafe<RetType(Args...)>;
         using DelegateType = Delegate<RetType(Args...)>;
+        using MulticastDelegateSafe<RetType(Args...)>::operator=;
 
         SignalSafe() = default;
         SignalSafe(const SignalSafe&) = delete;
@@ -44,13 +45,21 @@ namespace dmq {
         [[nodiscard]] Connection Connect(const DelegateType& delegate) {
             std::weak_ptr<SignalSafe> weakSelf;
 
+            // Handle Assert vs Exception environments
+#if !defined(__cpp_exceptions) || defined(DMQ_ASSERTS)
+            // No exceptions: We simply assume the object is managed by shared_ptr.
+            // If this object is on the stack, shared_from_this() will likely cause 
+            // a strict abort/terminate depending on the STL implementation.
+            weakSelf = this->shared_from_this();
+#else
             try {
                 weakSelf = this->shared_from_this();
             }
             catch (const std::bad_weak_ptr&) {
-                assert(false && "SignalSafe::Connect() requires the Signal instance to be managed by a std::shared_ptr. Use dmq::MakeSignal or std::make_shared.");
+                assert(false && "Signal::Connect() requires the Signal instance to be managed by a std::shared_ptr. Use std::make_shared.");
                 throw;
             }
+#endif
 
             this->PushBack(delegate);
 
@@ -66,6 +75,7 @@ namespace dmq {
         void operator+=(const DelegateType& delegate) {
             this->PushBack(delegate);
         }
+        XALLOCATOR
     };
 
     // Alias for the shared_ptr type
@@ -75,9 +85,18 @@ namespace dmq {
     // Helper to create it easily
     template<typename Signature>
     SignalPtr<Signature> MakeSignal() {
-        // If DMQ_ALLOCATOR is defined, DelegateBase::operator new is used.
-        // We must use 'new' explicitly. std::make_shared would use the system heap.
-        return std::shared_ptr<SignalSafe<Signature>>(new SignalSafe<Signature>());
+#ifdef DMQ_ALLOCATOR
+        // ALLOCATE_SHARED:
+        // Uses 'stl_allocator' to allocate the memory for BOTH the 
+        // SignalSafe object AND the shared_ptr Control Block.
+        // This ensures EVERYTHING lives in your Fixed-Block Pool.
+        return std::allocate_shared<SignalSafe<Signature>>(
+            stl_allocator<SignalSafe<Signature>>()
+        );
+#else
+        // Fallback for standard builds
+        return std::make_shared<SignalSafe<Signature>>();
+#endif
     }
 
 } // namespace dmq

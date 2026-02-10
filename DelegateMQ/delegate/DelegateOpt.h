@@ -10,9 +10,11 @@
 #if defined(DMQ_THREAD_FREERTOS)
     #include "predef/util/FreeRTOSClock.h"
     #include "predef/util/FreeRTOSMutex.h"
+    #include "predef/util/FreeRTOSConditionVariable.h"
 #elif defined(DMQ_THREAD_THREADX)
     #include "predef/util/ThreadXClock.h"
     #include "predef/util/ThreadXMutex.h"
+    #include "predef/util/ThreadXConditionVariable.h"
 #elif defined(DMQ_THREAD_ZEPHYR)
     #include "predef/util/ZephyrClock.h"
     #include "predef/util/ZephyrMutex.h"
@@ -21,6 +23,9 @@
     #include "predef/util/CmsisRtos2Mutex.h"
 #elif defined(DMQ_THREAD_NONE)
     #include "predef/util/BareMetalClock.h"
+#else
+    // Windows / Linux / macOS (Standard Library)
+    #include <condition_variable> 
 #endif
 
 namespace dmq
@@ -62,11 +67,13 @@ namespace dmq
     // Use the custom FreeRTOS wrapper
     using Mutex = dmq::FreeRTOSMutex;
     using RecursiveMutex = dmq::FreeRTOSRecursiveMutex;
+    using ConditionVariable = dmq::FreeRTOSConditionVariable;
 
 #elif defined(DMQ_THREAD_THREADX)
     // Use the custom ThreadX wrapper
     using Mutex = dmq::ThreadXMutex;
     using RecursiveMutex = dmq::ThreadXRecursiveMutex;
+    using ConditionVariable = dmq::ThreadXConditionVariable;
 
 #elif defined(DMQ_THREAD_ZEPHYR)
     // Use the custom Zephyr wrapper
@@ -91,16 +98,19 @@ namespace dmq
     // Windows / Linux / macOS / Qt
     using Mutex = std::mutex;
     using RecursiveMutex = std::recursive_mutex;
+    using ConditionVariable = std::condition_variable;
 #endif
 }
 
 // @TODO: Select the desired software fault handling (see Predef.cmake).
 #ifdef DMQ_ASSERTS
+    #include "predef/util/Fault.h"
     #include <cassert>
     // Use assert error handling. Change assert to a different error 
     // handler as required by the target application.
     #define BAD_ALLOC() assert(false && "Memory allocation failed!")
 #else
+    #include "predef/util/Fault.h"
     #include <new>
     // Use exception error handling
     #define BAD_ALLOC() throw std::bad_alloc()
@@ -113,10 +123,12 @@ namespace dmq
 // See master CMakeLists.txt for info on enabling the fixed-block allocator.
 #ifdef DMQ_ALLOCATOR
     // Use stl_allocator fixed-block allocator for dynamic storage allocation
+    #include "predef/allocator/xstring.h"
     #include "predef/allocator/xlist.h"
     #include "predef/allocator/xsstream.h"
     #include "predef/allocator/stl_allocator.h"
 #else
+    #include <string>
     #include <list>
     #include <sstream>
 
@@ -134,6 +146,9 @@ namespace dmq
 
     typedef std::basic_ostringstream<char, std::char_traits<char>> xostringstream;
     typedef std::basic_stringstream<char, std::char_traits<char>> xstringstream;
+
+    typedef std::string xstring;
+    typedef std::wstring xwstring;
 #endif
 
 // @TODO: Select the desired logging (see Predef.cmake).

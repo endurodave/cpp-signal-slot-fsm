@@ -1,7 +1,7 @@
 #include "NetworkEngine.h"
 
 // Only compile implementation if a compatible transport is selected
-#if defined(DMQ_TRANSPORT_ZEROMQ) || defined(DMQ_TRANSPORT_WIN32_UDP) || defined(DMQ_TRANSPORT_LINUX_UDP)
+#if defined(DMQ_TRANSPORT_ZEROMQ) || defined(DMQ_TRANSPORT_WIN32_UDP) || defined(DMQ_TRANSPORT_LINUX_UDP) || defined(DMQ_TRANSPORT_STM32_UART) || defined(DMQ_TRANSPORT_SERIAL_PORT)
 
 using namespace dmq;
 using namespace std;
@@ -9,23 +9,46 @@ using namespace std;
 const std::chrono::milliseconds NetworkEngine::SEND_TIMEOUT(100);
 const std::chrono::milliseconds NetworkEngine::RECV_TIMEOUT(2000);
 
+// [STM32-FreeRTOS] Define Static Stack for Network Thread
+// Increase size to 2048 words (8KB) to handle Debug mode call depths.
+#if defined(DMQ_TRANSPORT_STM32_UART) && defined(DMQ_THREAD_FREERTOS)
+    static StackType_t g_networkThreadStack[2048];
+#endif
+
 NetworkEngine::NetworkEngine()
     : m_thread("NetworkEngine"),
-    m_transportMonitor(RECV_TIMEOUT)
+    m_transportMonitor(RECV_TIMEOUT),
+    m_recvThread("NetworkRecv")
 #if defined(DMQ_TRANSPORT_WIN32_UDP) || defined(DMQ_TRANSPORT_LINUX_UDP)
-    // Only initialize reliability layers for UDP transports
+    , m_retryMonitor(m_sendTransport, m_transportMonitor)
+    , m_reliableTransport(m_sendTransport, m_retryMonitor)
+#elif defined(DMQ_TRANSPORT_STM32_UART)
+    , m_transport()                     // Init the real object
+    , m_sendTransport(m_transport)      // Alias it
+    , m_recvTransport(m_transport)      // Alias it
+    , m_retryMonitor(m_sendTransport, m_transportMonitor)
+    , m_reliableTransport(m_sendTransport, m_retryMonitor)
+#elif defined(DMQ_TRANSPORT_SERIAL_PORT)
+    // Initialize references to point to the single m_transport instance
+    , m_transport()
+    , m_sendTransport(m_transport)
+    , m_recvTransport(m_transport)
     , m_retryMonitor(m_sendTransport, m_transportMonitor)
     , m_reliableTransport(m_sendTransport, m_retryMonitor)
 #endif
 {
-    m_thread.CreateThread(std::chrono::milliseconds(5000));
+#if defined(DMQ_TRANSPORT_STM32_UART) && defined(DMQ_THREAD_FREERTOS)
+    // Apply the static stack buffer to prevent overflow
+    m_thread.SetStackMem(g_networkThreadStack, 2048);
+#endif
+
+    m_thread.CreateThread();
 }
 
 NetworkEngine::~NetworkEngine()
 {
     Stop();
     m_thread.ExitThread();
-    delete m_recvThread;
 }
 
 // SWITCH: Initialize Implementation
@@ -89,6 +112,65 @@ int NetworkEngine::Initialize(const std::string& sendIp, int sendPort, const std
     return err;
 }
 
+#elif defined(DMQ_TRANSPORT_STM32_UART)
+
+// --------------------------------------------------------
+// STM32 UART Implementation
+// --------------------------------------------------------
+int NetworkEngine::Initialize(UART_HandleTypeDef* huart)
+{
+    if (Thread::GetCurrentThreadId() != m_thread.GetThreadId())
+        return MakeDelegate(this, &NetworkEngine::Initialize, m_thread, WAIT_INFINITE)(huart);
+
+    int err = 0;
+
+    // Call Create ONCE on the shared object
+    err += m_transport.Create(huart);
+
+    m_statusConn = m_transportMonitor.OnSendStatus->Connect(dmq::MakeDelegate(this, &NetworkEngine::InternalStatusHandler));
+
+    m_transport.SetTransportMonitor(&m_transportMonitor);
+
+    // Point to self for full-duplex logic
+    m_transport.SetRecvTransport(&m_transport);
+    m_transport.SetSendTransport(&m_transport);
+
+    // Use Reliable wrapper
+    m_dispatcher.SetTransport(&m_reliableTransport);
+
+    return err;
+}
+#elif defined(DMQ_TRANSPORT_SERIAL_PORT)
+
+// --------------------------------------------------------
+// Serial Port Implementation (Shared Send/Recv)
+// --------------------------------------------------------
+int NetworkEngine::Initialize(const std::string& portName, int baudRate)
+{
+    if (Thread::GetCurrentThreadId() != m_thread.GetThreadId())
+        return MakeDelegate(this, &NetworkEngine::Initialize, m_thread, WAIT_INFINITE)(portName, baudRate);
+
+    int err = 0;
+
+    // OPEN PORT ONCE via the shared instance
+    err += m_transport.Create(portName.c_str(), baudRate);
+
+    if (err == 0) {
+        // Only hook up monitoring if open succeeded
+        m_statusConn = m_transportMonitor.OnSendStatus->Connect(dmq::MakeDelegate(this, &NetworkEngine::InternalStatusHandler));
+
+        m_transport.SetTransportMonitor(&m_transportMonitor);
+
+        // Serial is full-duplex logic logic on one object
+        m_transport.SetRecvTransport(&m_transport);
+        m_transport.SetSendTransport(&m_transport);
+
+        // Route dispatcher through reliability layer (ACKs/Retries)
+        m_dispatcher.SetTransport(&m_reliableTransport);
+    }
+
+    return err;
+}
 #endif
 
 void NetworkEngine::Start()
@@ -96,8 +178,15 @@ void NetworkEngine::Start()
     if (Thread::GetCurrentThreadId() != m_thread.GetThreadId())
         return MakeDelegate(this, &NetworkEngine::Start, m_thread)();
 
-    if (!m_recvThread) {
-        m_recvThread = new std::thread(&NetworkEngine::RecvThread, this);
+    static bool bRecvThreadCreated = false;
+
+    if (!bRecvThreadCreated)
+    {
+        bRecvThreadCreated = true;
+        m_recvThread.CreateThread();
+
+        // Post the "RecvThread" loop to run on this new thread.
+        MakeDelegate(this, &NetworkEngine::RecvThread, m_recvThread).AsyncInvoke();
     }
 
     m_timeoutTimerConn = m_timeoutTimer.OnExpired->Connect(MakeDelegate(this, &NetworkEngine::Timeout, m_thread));
@@ -113,11 +202,8 @@ void NetworkEngine::Stop()
         m_sendTransport.Close();
 
         m_recvThreadExit = true;
-        if (m_recvThread && m_recvThread->joinable()) {
-            m_recvThread->join();
-            delete m_recvThread;
-            m_recvThread = nullptr;
-        }
+        m_recvThread.ExitThread();
+
         return MakeDelegate(this, &NetworkEngine::Stop, m_thread, WAIT_INFINITE)();
     }
     m_timeoutTimer.Stop();

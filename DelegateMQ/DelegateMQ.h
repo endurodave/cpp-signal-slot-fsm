@@ -102,10 +102,9 @@
 // -----------------------------------------------------------------------------
 // 4. Asynchronous "Blocking" Delegates (Wait for Result)
 // -----------------------------------------------------------------------------
-// Depends on std::future/std::promise. 
-// Valid for StdLib (Windows/Linux) and Qt.
-// (RTOS support depends on if the toolchain provides a full C++ STL)
-#if defined(DMQ_THREAD_STDLIB) || defined(DMQ_THREAD_QT)
+// Depends on Semaphore/Mutex and C++17 (std::any, std::optional).
+// Valid for StdLib (Windows/Linux), Qt, ThreadX, and FreeRTOS (if C++17 enabled).
+#if defined(DMQ_THREAD_STDLIB) || defined(DMQ_THREAD_QT) || defined(DMQ_THREAD_FREERTOS) || defined(DMQ_THREAD_THREADX)
     #include "delegate/DelegateAsyncWait.h"
 #endif
 
@@ -130,7 +129,7 @@
 #elif defined(DMQ_THREAD_NONE)
     // Bare metal: User must implement their own polling/interrupt logic
 #else
-    #error "Thread implementation not found."
+    #warning "Thread implementation not found."
 #endif
 
 #if defined(DMQ_SERIALIZE_MSGPACK)
@@ -146,7 +145,7 @@
 #elif defined(DMQ_SERIALIZE_NONE)
     // Create a custom application-specific serializer
 #else
-    #error "Serialize implementation not found."
+    #warning "Serialize implementation not found."
 #endif
 
 #if defined(DMQ_TRANSPORT_ZEROMQ)
@@ -179,21 +178,22 @@
 #elif defined(DMQ_TRANSPORT_ARM_LWIP_UDP)
     #include "predef/dispatcher/Dispatcher.h"
     #include "predef/transport/arm-lwip-udp/ArmLwipUdpTransport.h"
+#elif defined(DMQ_TRANSPORT_ARM_LWIP_NETCONN_UDP)
+    #include "predef/dispatcher/Dispatcher.h"
+    #include "predef/transport/arm-lwip-netconn-udp/ArmLwipNetconnUdpTransport.h"
 #elif defined(DMQ_TRANSPORT_THREADX_UDP)
     #include "predef/dispatcher/Dispatcher.h"
     #include "predef/transport/threadx-udp/NetXUdpTransport.h"
+#elif defined(DMQ_TRANSPORT_STM32_UART)
+    #include "predef/dispatcher/Dispatcher.h"
+    #include "predef/transport/stm32-uart/Stm32UartTransport.h"
 #elif defined(DMQ_TRANSPORT_ZEPHYR_UDP)
     #include "predef/dispatcher/Dispatcher.h"
     #include "predef/transport/zephyr-udp/ZephyrUdpTransport.h"
 #elif defined(DMQ_TRANSPORT_NONE)
     // Create a custom application-specific transport
 #else
-    #error "Transport implementation not found."
-#endif
-
-#if defined(DMQ_TRANSPORT_ZEROMQ) || defined(DMQ_TRANSPORT_WIN32_UDP) || defined(DMQ_TRANSPORT_LINUX_UDP) || \
-    defined(DMQ_TRANSPORT_THREADX_UDP) || defined(DMQ_TRANSPORT_ZEPHYR_UDP)
-    #include "predef/util/NetworkEngine.h"
+    #warning "Transport implementation not found."
 #endif
 
 #include "predef/util/Fault.h"
@@ -203,6 +203,13 @@
     #include "predef/util/Timer.h"
     #include "predef/util/AsyncInvoke.h"
     #include "predef/util/TransportMonitor.h"
+#endif
+
+// Only include NetworkEngine if a transport that uses it is active
+#if defined(DMQ_TRANSPORT_ZEROMQ) || defined(DMQ_TRANSPORT_WIN32_UDP) || \
+    defined(DMQ_TRANSPORT_LINUX_UDP) || defined(DMQ_TRANSPORT_STM32_UART) || \
+    defined(DMQ_TRANSPORT_SERIAL_PORT)
+    #include "predef/util/NetworkEngine.h"
 #endif
 
 #endif

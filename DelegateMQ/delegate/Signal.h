@@ -82,6 +82,7 @@ namespace dmq {
         std::weak_ptr<void> m_watcher;
         std::function<void()> m_disconnect;
         bool m_connected = false;
+        XALLOCATOR
     };
 
     /// @brief RAII wrapper for Connection. Automatically disconnects when it goes out of scope.
@@ -108,6 +109,7 @@ namespace dmq {
 
     private:
         Connection m_connection;
+        XALLOCATOR
     };
 
     // --- Signal Containers ---
@@ -125,6 +127,7 @@ namespace dmq {
     public:
         using BaseType = MulticastDelegate<RetType(Args...)>;
         using DelegateType = Delegate<RetType(Args...)>;
+        using MulticastDelegate<RetType(Args...)>::operator=;
 
         Signal() = default;
         Signal(const Signal&) = delete;
@@ -137,6 +140,13 @@ namespace dmq {
         [[nodiscard]] Connection Connect(const DelegateType& delegate) {
             std::weak_ptr<Signal> weakSelf;
 
+            // Handle Assert vs Exception environments
+#if !defined(__cpp_exceptions) || defined(DMQ_ASSERTS)
+            // No exceptions: We simply assume the object is managed by shared_ptr.
+            // If this object is on the stack, shared_from_this() will likely cause 
+            // a strict abort/terminate depending on the STL implementation.
+            weakSelf = this->shared_from_this();
+#else
             try {
                 weakSelf = this->shared_from_this();
             }
@@ -144,6 +154,7 @@ namespace dmq {
                 assert(false && "Signal::Connect() requires the Signal instance to be managed by a std::shared_ptr. Use std::make_shared.");
                 throw;
             }
+#endif
 
             this->PushBack(delegate);
 
@@ -159,6 +170,7 @@ namespace dmq {
         void operator+=(const DelegateType& delegate) {
             this->PushBack(delegate);
         }
+        XALLOCATOR
     };
 
 } // namespace dmq
