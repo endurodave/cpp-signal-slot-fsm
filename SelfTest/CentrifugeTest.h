@@ -10,53 +10,57 @@
 class CentrifugeTest : public SelfTest
 {
 public:
-	CentrifugeTest();
-	virtual void Start(const StartData* data);
+    CentrifugeTest();
+    virtual void Start(const StartData* data);
 
 private:
-	void Poll();
+    void Poll();
 
-	// Timer used to generate periodic callbacks to the Poll() event.
-	Timer m_pollTimer;
+    // Timer used to generate periodic callbacks to the Poll() event.
+    Timer m_pollTimer;
 
-	INT m_speed; 
+    // RAII Connection handle for the timer.
+    // Keeps the subscription active as long as this object exists or until Disconnect() is called.
+    dmq::ScopedConnection m_pollTimerConn;
 
-	// State enumeration order must match the order of state method entries
-	// in the state map.
-	enum States
-	{
-		// Continue state numbering using the last SelfTest::States enum value
-		ST_START_TEST = SelfTest::ST_MAX_STATES,	
-		ST_ACCELERATION,
-		ST_WAIT_FOR_ACCELERATION,
-		ST_DECELERATION,
-		ST_WAIT_FOR_DECELERATION,
-		ST_MAX_STATES
-	};
+    INT m_speed;
 
-	// Define the state machine state functions with event data type
-	STATE_DECLARE(CentrifugeTest, 	Idle,						NoEventData)
-	STATE_DECLARE(CentrifugeTest, 	StartTest,					StartData)
-	GUARD_DECLARE(CentrifugeTest, 	GuardStartTest,				NoEventData)
-	STATE_DECLARE(CentrifugeTest, 	Acceleration,				NoEventData)
-	STATE_DECLARE(CentrifugeTest, 	WaitForAcceleration,		NoEventData)
-	EXIT_DECLARE(CentrifugeTest, 	ExitWaitForAcceleration)
-	STATE_DECLARE(CentrifugeTest, 	Deceleration,				NoEventData)
-	STATE_DECLARE(CentrifugeTest, 	WaitForDeceleration,		NoEventData)
-	EXIT_DECLARE(CentrifugeTest, 	ExitWaitForDeceleration)
+    // State enumeration order must match the order of state method entries
+    // in the state map.
+    enum States
+    {
+        // Continue state numbering using the last SelfTest::States enum value
+        ST_START_TEST = SelfTest::ST_MAX_STATES,
+        ST_ACCELERATION,
+        ST_WAIT_FOR_ACCELERATION,
+        ST_DECELERATION,
+        ST_WAIT_FOR_DECELERATION,
+        ST_MAX_STATES
+    };
 
-	// State map to define state object order. Each state map entry defines a
-	// state object.
-	BEGIN_STATE_MAP_EX
-		STATE_MAP_ENTRY_ALL_EX(&Idle, 0, &EntryIdle, 0)
-		STATE_MAP_ENTRY_EX(&Completed)
-		STATE_MAP_ENTRY_EX(&Failed)
-		STATE_MAP_ENTRY_ALL_EX(&StartTest, &GuardStartTest, 0, 0)
-		STATE_MAP_ENTRY_EX(&Acceleration)
-		STATE_MAP_ENTRY_ALL_EX(&WaitForAcceleration, 0, 0, &ExitWaitForAcceleration)
-		STATE_MAP_ENTRY_EX(&Deceleration)
-		STATE_MAP_ENTRY_ALL_EX(&WaitForDeceleration, 0, 0, &ExitWaitForDeceleration)
-	END_STATE_MAP_EX	
+    // Define the state machine state functions with event data type
+    STATE_DECLARE(CentrifugeTest, Idle, NoEventData)
+    STATE_DECLARE(CentrifugeTest, StartTest, StartData)
+    GUARD_DECLARE(CentrifugeTest, GuardStartTest, NoEventData)
+    STATE_DECLARE(CentrifugeTest, Acceleration, NoEventData)
+    STATE_DECLARE(CentrifugeTest, WaitForAcceleration, NoEventData)
+    EXIT_DECLARE(CentrifugeTest, ExitWaitForAcceleration)
+    STATE_DECLARE(CentrifugeTest, Deceleration, NoEventData)
+    STATE_DECLARE(CentrifugeTest, WaitForDeceleration, NoEventData)
+    EXIT_DECLARE(CentrifugeTest, ExitWaitForDeceleration)
+
+    // State map to define state object order. Each state map entry defines a
+    // state object.
+    BEGIN_STATE_MAP_EX
+        STATE_MAP_ENTRY_ALL_EX(&Idle, 0, &EntryIdle, 0)
+        STATE_MAP_ENTRY_EX(&Completed)
+        STATE_MAP_ENTRY_EX(&Failed)
+        STATE_MAP_ENTRY_ALL_EX(&StartTest, &GuardStartTest, 0, 0)
+        STATE_MAP_ENTRY_EX(&Acceleration)
+        STATE_MAP_ENTRY_ALL_EX(&WaitForAcceleration, 0, 0, &ExitWaitForAcceleration)
+        STATE_MAP_ENTRY_EX(&Deceleration)
+        STATE_MAP_ENTRY_ALL_EX(&WaitForDeceleration, 0, 0, &ExitWaitForDeceleration)
+    END_STATE_MAP_EX
 };
 
 #endif

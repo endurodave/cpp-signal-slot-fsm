@@ -6,7 +6,7 @@
 // SelfTest
 //------------------------------------------------------------------------------
 SelfTest::SelfTest(INT maxStates) :
-	StateMachine(maxStates)
+    StateMachine(maxStates)
 {
 }
 
@@ -15,12 +15,12 @@ SelfTest::SelfTest(INT maxStates) :
 //------------------------------------------------------------------------------
 void SelfTest::Cancel()
 {
-	// State machine base classes can't use a transition map, only the 
-	// most-derived state machine class within the hierarchy can. So external 
-	// events like this use the current state and call ExternalEvent()
-	// to invoke the state machine transition. 
-	if (GetCurrentState() != ST_IDLE)
-		ExternalEvent(ST_FAILED);
+    // State machine base classes can't use a transition map, only the 
+    // most-derived state machine class within the hierarchy can. So external 
+    // events like this use the current state and call ExternalEvent()
+    // to invoke the state machine transition. 
+    if (GetCurrentState() != ST_IDLE)
+        ExternalEvent(ST_FAILED);
 }
 
 //------------------------------------------------------------------------------
@@ -28,7 +28,7 @@ void SelfTest::Cancel()
 //------------------------------------------------------------------------------
 STATE_DEFINE(SelfTest, Idle, NoEventData)
 {
-	SelfTestEngine::InvokeStatusCallback("SelfTest::ST_Idle");
+    SelfTestEngine::InvokeStatusSignal("SelfTest::ST_Idle");
 }
 
 //------------------------------------------------------------------------------
@@ -36,7 +36,7 @@ STATE_DEFINE(SelfTest, Idle, NoEventData)
 //------------------------------------------------------------------------------
 ENTRY_DEFINE(SelfTest, EntryIdle, NoEventData)
 {
-	SelfTestEngine::InvokeStatusCallback("SelfTest::EN_EntryIdle");
+    SelfTestEngine::InvokeStatusSignal("SelfTest::EN_EntryIdle");
 }
 
 //------------------------------------------------------------------------------
@@ -44,12 +44,13 @@ ENTRY_DEFINE(SelfTest, EntryIdle, NoEventData)
 //------------------------------------------------------------------------------
 STATE_DEFINE(SelfTest, Completed, NoEventData)
 {
-	SelfTestEngine::InvokeStatusCallback("SelfTest::ST_Completed");
+    SelfTestEngine::InvokeStatusSignal("SelfTest::ST_Completed");
 
-	if (CompletedCallback)
-		CompletedCallback();
+    // Use OnCompleted (the SignalPtr) and dereference to invoke
+    if (OnCompleted)
+        (*OnCompleted)();
 
-	InternalEvent(ST_IDLE);
+    InternalEvent(ST_IDLE);
 }
 
 //------------------------------------------------------------------------------
@@ -57,11 +58,11 @@ STATE_DEFINE(SelfTest, Completed, NoEventData)
 //------------------------------------------------------------------------------
 STATE_DEFINE(SelfTest, Failed, NoEventData)
 {
-	SelfTestEngine::InvokeStatusCallback("SelfTest::ST_Failed");
+    SelfTestEngine::InvokeStatusSignal("SelfTest::ST_Failed");
 
-	if (FailedCallback)
-		FailedCallback();
+    // Use OnFailed (the SignalPtr) and dereference to invoke
+    if (OnFailed)
+        (*OnFailed)();
 
-	InternalEvent(ST_IDLE);
+    InternalEvent(ST_IDLE);
 }
-

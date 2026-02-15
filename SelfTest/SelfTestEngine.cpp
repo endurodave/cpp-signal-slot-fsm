@@ -2,45 +2,49 @@
 
 using namespace dmq;
 
-MulticastDelegateSafe<void(const SelfTestStatus&)> SelfTestEngine::StatusCallback;
-
 //------------------------------------------------------------------------------
 // GetInstance
 //------------------------------------------------------------------------------
 SelfTestEngine& SelfTestEngine::GetInstance()
 {
-	static SelfTestEngine instance;
-	return instance;
+    static SelfTestEngine instance;
+    return instance;
 }
 
 //------------------------------------------------------------------------------
 // SelfTestEngine
 //------------------------------------------------------------------------------
 SelfTestEngine::SelfTestEngine() :
-	SelfTest(ST_MAX_STATES),
-	m_thread("SelfTestEngine")
+    SelfTest(ST_MAX_STATES),
+    m_thread("SelfTestEngine")
 {
-	// Register for callbacks when sub self-test state machines complete or fail
-	m_centrifugeTest.CompletedCallback += MakeDelegate(this, &SelfTestEngine::Complete, m_thread);
-	m_centrifugeTest.FailedCallback += MakeDelegate<SelfTest>(this, &SelfTest::Cancel, m_thread);
-	m_pressureTest.CompletedCallback += MakeDelegate(this, &SelfTestEngine::Complete, m_thread);
-	m_pressureTest.FailedCallback += MakeDelegate<SelfTest>(this, &SelfTest::Cancel, m_thread);
+    // Important: Start the thread so it can process delegates
+    m_thread.CreateThread();
+
+    // Register for signals when sub self-test state machines complete or fail.
+    // We MUST store the returned connection object, otherwise it will 
+    // fall out of scope and disconnect immediately.
+    m_centrifugeCompleteConn = m_centrifugeTest.OnCompleted->Connect(MakeDelegate(this, &SelfTestEngine::Complete, m_thread));
+    m_centrifugeFailedConn = m_centrifugeTest.OnFailed->Connect(MakeDelegate<SelfTest>(this, &SelfTest::Cancel, m_thread));
+
+    m_pressureCompleteConn = m_pressureTest.OnCompleted->Connect(MakeDelegate(this, &SelfTestEngine::Complete, m_thread));
+    m_pressureFailedConn = m_pressureTest.OnFailed->Connect(MakeDelegate<SelfTest>(this, &SelfTest::Cancel, m_thread));
 }
 
 //------------------------------------------------------------------------------
-// InvokeStatusCallback
+// InvokeStatusSignal
 //------------------------------------------------------------------------------
-void SelfTestEngine::InvokeStatusCallback(std::string msg)
+void SelfTestEngine::InvokeStatusSignal(std::string msg)
 {
-	// Client(s) registered?
-	if (StatusCallback)
-	{
-		SelfTestStatus status;
-		status.message = msg;
+    // Client(s) registered?
+    if (OnStatus)
+    {
+        SelfTestStatus status;
+        status.message = msg;
 
-		// Callback registered client(s)
-		StatusCallback(status);
-	}
+        // Callback registered client(s) via dereference
+        (*OnStatus)(status);
+    }
 }
 
 //------------------------------------------------------------------------------
@@ -48,7 +52,7 @@ void SelfTestEngine::InvokeStatusCallback(std::string msg)
 //------------------------------------------------------------------------------
 void SelfTestEngine::Start(const StartData* data)
 {
-	// Is the caller executing on m_thread?
+    // Is the caller executing on m_thread?
     if (m_thread.GetThreadId() != Thread::GetCurrentThreadId())
     {
         // Create an asynchronous delegate and reinvoke the function call on m_thread
@@ -57,13 +61,13 @@ void SelfTestEngine::Start(const StartData* data)
         return;
     }
 
-	BEGIN_TRANSITION_MAP			              			// - Current State -
-		TRANSITION_MAP_ENTRY (ST_START_CENTRIFUGE_TEST)		// ST_IDLE
-		TRANSITION_MAP_ENTRY (CANNOT_HAPPEN)				// ST_COMPLETED
-		TRANSITION_MAP_ENTRY (CANNOT_HAPPEN)				// ST_FAILED
-		TRANSITION_MAP_ENTRY (EVENT_IGNORED)				// ST_START_CENTRIFUGE_TEST
-		TRANSITION_MAP_ENTRY (EVENT_IGNORED)				// ST_START_PRESSURE_TEST
-	END_TRANSITION_MAP(data)
+    BEGIN_TRANSITION_MAP                                    // - Current State -
+        TRANSITION_MAP_ENTRY(ST_START_CENTRIFUGE_TEST)      // ST_IDLE
+        TRANSITION_MAP_ENTRY(CANNOT_HAPPEN)                 // ST_COMPLETED
+        TRANSITION_MAP_ENTRY(CANNOT_HAPPEN)                 // ST_FAILED
+        TRANSITION_MAP_ENTRY(EVENT_IGNORED)                 // ST_START_CENTRIFUGE_TEST
+        TRANSITION_MAP_ENTRY(EVENT_IGNORED)                 // ST_START_PRESSURE_TEST
+    END_TRANSITION_MAP(data)
 }
 
 //------------------------------------------------------------------------------
@@ -71,13 +75,13 @@ void SelfTestEngine::Start(const StartData* data)
 //------------------------------------------------------------------------------
 void SelfTestEngine::Complete()
 {
-	BEGIN_TRANSITION_MAP			              			// - Current State -
-		TRANSITION_MAP_ENTRY (EVENT_IGNORED)				// ST_IDLE
-		TRANSITION_MAP_ENTRY (CANNOT_HAPPEN)				// ST_COMPLETED
-		TRANSITION_MAP_ENTRY (CANNOT_HAPPEN)				// ST_FAILED
-		TRANSITION_MAP_ENTRY (ST_START_PRESSURE_TEST)		// ST_START_CENTRIFUGE_TEST
-		TRANSITION_MAP_ENTRY (ST_COMPLETED)					// ST_START_PRESSURE_TEST
-	END_TRANSITION_MAP(NULL)
+    BEGIN_TRANSITION_MAP                                    // - Current State -
+        TRANSITION_MAP_ENTRY(EVENT_IGNORED)                 // ST_IDLE
+        TRANSITION_MAP_ENTRY(CANNOT_HAPPEN)                 // ST_COMPLETED
+        TRANSITION_MAP_ENTRY(CANNOT_HAPPEN)                 // ST_FAILED
+        TRANSITION_MAP_ENTRY(ST_START_PRESSURE_TEST)        // ST_START_CENTRIFUGE_TEST
+        TRANSITION_MAP_ENTRY(ST_COMPLETED)                  // ST_START_PRESSURE_TEST
+    END_TRANSITION_MAP(NULL)
 }
 
 //------------------------------------------------------------------------------
@@ -85,10 +89,10 @@ void SelfTestEngine::Complete()
 //------------------------------------------------------------------------------
 STATE_DEFINE(SelfTestEngine, StartCentrifugeTest, StartData)
 {
-	m_startData = *data;
+    m_startData = *data;
 
-	InvokeStatusCallback("SelfTestEngine::ST_CentrifugeTest");
-	m_centrifugeTest.Start(&m_startData);
+    InvokeStatusSignal("SelfTestEngine::ST_CentrifugeTest");
+    m_centrifugeTest.Start(&m_startData);
 }
 
 //------------------------------------------------------------------------------
@@ -96,7 +100,6 @@ STATE_DEFINE(SelfTestEngine, StartCentrifugeTest, StartData)
 //------------------------------------------------------------------------------
 STATE_DEFINE(SelfTestEngine, StartPressureTest, NoEventData)
 {
-	InvokeStatusCallback("SelfTestEngine::ST_PressureTest");
- 	m_pressureTest.Start(&m_startData);
+    InvokeStatusSignal("SelfTestEngine::ST_PressureTest");
+    m_pressureTest.Start(&m_startData);
 }
-
