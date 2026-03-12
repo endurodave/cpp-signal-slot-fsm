@@ -17,9 +17,8 @@ class SelfTest : public StateMachine
 {
 public:
     // Signals generated when the self-test completes or fails.
-    // We use SignalPtr (std::shared_ptr) to support RAII connections.
-    dmq::SignalPtr<void(void)> OnCompleted = dmq::MakeSignal<void(void)>();
-    dmq::SignalPtr<void(void)> OnFailed = dmq::MakeSignal<void(void)>();
+    dmq::Signal<void(void)> OnCompleted;
+    dmq::Signal<void(void)> OnFailed;
 
     SelfTest(INT maxStates);
 

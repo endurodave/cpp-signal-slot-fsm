@@ -46,9 +46,7 @@ STATE_DEFINE(SelfTest, Completed, NoEventData)
 {
     SelfTestEngine::InvokeStatusSignal("SelfTest::ST_Completed");
 
-    // Use OnCompleted (the SignalPtr) and dereference to invoke
-    if (OnCompleted)
-        (*OnCompleted)();
+    OnCompleted();
 
     InternalEvent(ST_IDLE);
 }
@@ -60,9 +58,7 @@ STATE_DEFINE(SelfTest, Failed, NoEventData)
 {
     SelfTestEngine::InvokeStatusSignal("SelfTest::ST_Failed");
 
-    // Use OnFailed (the SignalPtr) and dereference to invoke
-    if (OnFailed)
-        (*OnFailed)();
+    OnFailed();
 
     InternalEvent(ST_IDLE);
 }

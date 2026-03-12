@@ -17,8 +17,7 @@ class SelfTestEngine : public SelfTest
 {
 public:
     // Clients register for asynchronous self-test status signals
-    static inline dmq::SignalPtr<void(const SelfTestStatus&)> OnStatus =
-        dmq::MakeSignal<void(const SelfTestStatus&)>();
+    static inline dmq::Signal<void(const SelfTestStatus&)> OnStatus;
 
     // Singleton instance of SelfTestEngine
     static SelfTestEngine& GetInstance();

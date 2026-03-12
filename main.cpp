@@ -109,12 +109,12 @@ int main(void)
     ScopedConnection completeConn;
 
     // Register for status updates (Static Signal)
-    statusConn = SelfTestEngine::OnStatus->Connect(
+    statusConn = SelfTestEngine::OnStatus.Connect(
         MakeDelegate(&OnSelfTestEngineStatus, userInterfaceThread)
     );
 
     // Register for completion (Instance Signal from base class SelfTest)
-    completeConn = SelfTestEngine::GetInstance().OnCompleted->Connect(
+    completeConn = SelfTestEngine::GetInstance().OnCompleted.Connect(
         MakeDelegate(&OnSelfTestEngineComplete, userInterfaceThread)
     );
 

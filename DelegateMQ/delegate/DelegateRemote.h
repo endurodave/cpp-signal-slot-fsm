@@ -131,7 +131,7 @@ private:
 };
 
 template <class R>
-struct DelegateFreeRemote; // Not defined
+class DelegateFreeRemote; // Not defined
 
 /// @brief `DelegateFreeRemote<>` class asynchronously invokes a free target function.
 /// @tparam RetType The return type of the bound delegate function.
@@ -169,9 +169,11 @@ public:
 
     /// @brief Move constructor that transfers ownership of resources.
     /// @param[in] rhs The object to move from.
-    DelegateFreeRemote(ClassType&& rhs) noexcept : 
-        BaseType(std::move(rhs)), m_id(rhs.m_id) {
+    DelegateFreeRemote(ClassType&& rhs) noexcept :
+        BaseType(std::move(rhs)), m_id(rhs.m_id),
+        m_dispatcher(rhs.m_dispatcher), m_serializer(rhs.m_serializer), m_stream(rhs.m_stream) {
         rhs.Clear();
+        rhs.m_dispatcher = nullptr; rhs.m_serializer = nullptr; rhs.m_stream = nullptr;
     }
 
     DelegateFreeRemote() = default;
@@ -557,7 +559,7 @@ private:
 };
 
 template <class C, class R>
-struct DelegateMemberRemote; // Not defined
+class DelegateMemberRemote; // Not defined
 
 /// @brief `DelegateMemberRemote<>` class asynchronously invokes a class member target function.
 /// @tparam TClass The class type that contains the member function.
@@ -624,8 +626,10 @@ public:
     /// @brief Move constructor that transfers ownership of resources.
     /// @param[in] rhs The object to move from.
     DelegateMemberRemote(ClassType&& rhs) noexcept :
-        BaseType(std::move(rhs)), m_id(rhs.m_id) {
+        BaseType(std::move(rhs)), m_id(rhs.m_id),
+        m_dispatcher(rhs.m_dispatcher), m_serializer(rhs.m_serializer), m_stream(rhs.m_stream) {
         rhs.Clear();
+        rhs.m_dispatcher = nullptr; rhs.m_serializer = nullptr; rhs.m_stream = nullptr;
     }
 
     DelegateMemberRemote() = default;
@@ -1048,7 +1052,7 @@ private:
 };
 
 template <class R>
-struct DelegateFunctionRemote; // Not defined
+class DelegateFunctionRemote; // Not defined
 
 /// @brief `DelegateFunctionRemote<>` class asynchronously invokes a `std::function` target function.
 /// @details Caution when binding to a `std::function` using this class. `std::function` cannot be 
@@ -1092,8 +1096,10 @@ public:
     /// @brief Move constructor that transfers ownership of resources.
     /// @param[in] rhs The object to move from.
     DelegateFunctionRemote(ClassType&& rhs) noexcept :
-        BaseType(std::move(rhs)), m_id(rhs.m_id) {
+        BaseType(std::move(rhs)), m_id(rhs.m_id),
+        m_dispatcher(rhs.m_dispatcher), m_serializer(rhs.m_serializer), m_stream(rhs.m_stream) {
         rhs.Clear();
+        rhs.m_dispatcher = nullptr; rhs.m_serializer = nullptr; rhs.m_stream = nullptr;
     }
 
     DelegateFunctionRemote() = default;

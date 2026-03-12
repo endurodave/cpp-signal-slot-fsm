@@ -24,11 +24,11 @@ SelfTestEngine::SelfTestEngine() :
     // Register for signals when sub self-test state machines complete or fail.
     // We MUST store the returned connection object, otherwise it will 
     // fall out of scope and disconnect immediately.
-    m_centrifugeCompleteConn = m_centrifugeTest.OnCompleted->Connect(MakeDelegate(this, &SelfTestEngine::Complete, m_thread));
-    m_centrifugeFailedConn = m_centrifugeTest.OnFailed->Connect(MakeDelegate<SelfTest>(this, &SelfTest::Cancel, m_thread));
+    m_centrifugeCompleteConn = m_centrifugeTest.OnCompleted.Connect(MakeDelegate(this, &SelfTestEngine::Complete, m_thread));
+    m_centrifugeFailedConn = m_centrifugeTest.OnFailed.Connect(MakeDelegate<SelfTest>(this, &SelfTest::Cancel, m_thread));
 
-    m_pressureCompleteConn = m_pressureTest.OnCompleted->Connect(MakeDelegate(this, &SelfTestEngine::Complete, m_thread));
-    m_pressureFailedConn = m_pressureTest.OnFailed->Connect(MakeDelegate<SelfTest>(this, &SelfTest::Cancel, m_thread));
+    m_pressureCompleteConn = m_pressureTest.OnCompleted.Connect(MakeDelegate(this, &SelfTestEngine::Complete, m_thread));
+    m_pressureFailedConn = m_pressureTest.OnFailed.Connect(MakeDelegate<SelfTest>(this, &SelfTest::Cancel, m_thread));
 }
 
 //------------------------------------------------------------------------------
@@ -36,15 +36,9 @@ SelfTestEngine::SelfTestEngine() :
 //------------------------------------------------------------------------------
 void SelfTestEngine::InvokeStatusSignal(std::string msg)
 {
-    // Client(s) registered?
-    if (OnStatus)
-    {
-        SelfTestStatus status;
-        status.message = msg;
-
-        // Callback registered client(s) via dereference
-        (*OnStatus)(status);
-    }
+    SelfTestStatus status;
+    status.message = msg;
+    OnStatus(status);
 }
 
 //------------------------------------------------------------------------------

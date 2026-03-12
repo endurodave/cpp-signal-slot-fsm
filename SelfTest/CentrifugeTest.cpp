@@ -72,7 +72,7 @@ STATE_DEFINE(CentrifugeTest, StartTest, StartData)
 
     // Register for timer callbacks using RAII
     // Note: We direct the callback to the Engine's thread (SelfTestEngine)
-    m_pollTimerConn = m_pollTimer.OnExpired->Connect(
+    m_pollTimerConn = m_pollTimer.OnExpired.Connect(
         MakeDelegate(this, &CentrifugeTest::Poll, SelfTestEngine::GetInstance().GetThread())
     );
 

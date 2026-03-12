@@ -14,7 +14,7 @@
 namespace dmq {
 
 template <class R>
-struct MulticastDelegate; // Not defined
+class MulticastDelegate; // Not defined
 
 /// @brief Not thread-safe multicast delegate container class. The class has a list of 
 /// `Delegate<>` instances. When invoked, each `Delegate` instance within the invocation 
@@ -26,7 +26,7 @@ public:
     using DelegateType = Delegate<RetType(Args...)>;
 
     MulticastDelegate() = default;
-    ~MulticastDelegate() { Clear(); }
+    virtual ~MulticastDelegate() { Clear(); }
 
     /// @brief Copy constructor that creates a copy of the given instance.
     /// @details This constructor initializes a new object as a copy of the 
@@ -180,7 +180,8 @@ private:
     /// Copy all delegate container objects.
     /// @param[in] other The container to copy from
     void CopyFrom(const MulticastDelegate& other) {
-        for (auto delegate : other.m_delegates) {
+        for (auto& delegate : other.m_delegates) {
+            if (!delegate) continue;  // Skip soft-deleted entries (mid-broadcast nulls)
             auto delegateClone = delegate->Clone();
             if (!delegateClone)
                 BAD_ALLOC();
