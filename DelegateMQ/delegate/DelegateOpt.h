@@ -12,9 +12,9 @@
     #error "RTTI compiler option is disabled but required by the DelegateMQ library."
 #endif
 
-#if defined(DMQ_THREAD_STDLIB) || defined(DMQ_THREAD_WIN32)
-    // Windows / Linux / macOS (Standard Library)
-    #include <condition_variable> 
+#if defined(DMQ_THREAD_STDLIB) || defined(DMQ_THREAD_WIN32) || defined(DMQ_THREAD_QT)
+    // Windows / Linux / macOS / Qt (Standard Library)
+    #include <condition_variable>
 #elif defined(DMQ_THREAD_FREERTOS)
     #include "predef/util/FreeRTOSClock.h"
     #include "predef/util/FreeRTOSMutex.h"
@@ -38,7 +38,7 @@ namespace dmq
     // @TODO: Change aliases to switch clock type globally if necessary
 
     // --- CLOCK SELECTION ---
-#if defined(DMQ_THREAD_STDLIB) || defined(DMQ_THREAD_WIN32)
+#if defined(DMQ_THREAD_STDLIB) || defined(DMQ_THREAD_WIN32) || defined(DMQ_THREAD_QT)
     // Windows / Linux / macOS / Qt
     using Clock = std::chrono::steady_clock;
 
@@ -68,7 +68,7 @@ namespace dmq
     using TimePoint = typename Clock::time_point;
 
     // --- MUTEX / LOCK SELECTION ---
-#if defined(DMQ_THREAD_STDLIB) || defined(DMQ_THREAD_WIN32)
+#if defined(DMQ_THREAD_STDLIB) || defined(DMQ_THREAD_WIN32) || defined(DMQ_THREAD_QT)
     // Windows / Linux / macOS / Qt
     using Mutex = std::mutex;
     using RecursiveMutex = std::recursive_mutex;
@@ -139,10 +139,13 @@ namespace dmq
     #include "predef/allocator/xlist.h"
     #include "predef/allocator/xsstream.h"
     #include "predef/allocator/stl_allocator.h"
+    #include "predef/allocator/xnew.h"
 #else
     #include <string>
     #include <list>
     #include <sstream>
+    #include <memory>
+    #include <utility>
 
     // Not using xallocator; define as nothing
     #undef XALLOCATOR
@@ -161,6 +164,24 @@ namespace dmq
 
     typedef std::string xstring;
     typedef std::wstring xwstring;
+
+    // Fallback xmake_shared — uses std::make_shared when fixed-block allocator is disabled
+    template <typename T, typename... Args>
+    inline std::shared_ptr<T> xmake_shared(Args&&... args)
+    {
+        return std::make_shared<T>(std::forward<Args>(args)...);
+    }
+
+    // Fallback xnew/xdelete — use standard new/delete when fixed-block allocator is disabled
+    template<typename T, typename... Args>
+    inline T* xnew(Args&&... args) {
+        return new(std::nothrow) T(std::forward<Args>(args)...);
+    }
+
+    template<typename T>
+    inline void xdelete(T* p) {
+        delete p;
+    }
 #endif
 
 // @TODO: Select the desired logging (see Predef.cmake).

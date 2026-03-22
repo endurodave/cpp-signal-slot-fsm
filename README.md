@@ -7,6 +7,8 @@
 
 A Finite State Machine (FSM) combining [C++ State Machine](https://github.com/endurodave/StateMachine) with the [DelegateMQ](https://github.com/endurodave/DelegateMQ) asynchronous Signal-Slot library.
 
+  ⚠️ See [**Active-Object State Machine in C++**](https://github.com/endurodave/active-fsm) for a compact active-object C++ finite state machine providing RAII-safe asynchronous dispatch and pub/sub signals.
+
 # Table of Contents
 
 - [C++ State Machine with Signal-Slots](#c-state-machine-with-signal-slots)

@@ -84,7 +84,7 @@ bool Thread::CreateThread()
         ret = tx_thread_create(&m_thread,
                                (CHAR*)THREAD_NAME.c_str(),
                                &Thread::Process,
-                               (ULONG)this, // Pass 'this' as entry input
+                               (ULONG)(ULONG_PTR)this, // Pass 'this' as entry input
                                m_stackMemory.get(),
                                stackSizeWords * sizeof(ULONG),
                                m_priority,
@@ -174,6 +174,14 @@ TX_THREAD* Thread::GetThreadId()
 TX_THREAD* Thread::GetCurrentThreadId()
 {
     return tx_thread_identify();
+}
+
+//----------------------------------------------------------------------------
+// IsCurrentThread
+//----------------------------------------------------------------------------
+bool Thread::IsCurrentThread()
+{
+    return GetThreadId() == GetCurrentThreadId();
 }
 
 //----------------------------------------------------------------------------

@@ -165,6 +165,8 @@ public:
     ///         or call `Disconnect()` manually.
     [[nodiscard]] ScopedConnection Connect(const DelegateType& delegate) {
         auto copy  = std::shared_ptr<DelegateType>(delegate.Clone());
+        if (!copy)
+            BAD_ALLOC();
         auto state = m_state;
         {
             std::lock_guard<RecursiveMutex> lock(state->mtx);
@@ -216,7 +218,7 @@ private:
         xlist<std::shared_ptr<DelegateType>> delegates;
         XALLOCATOR
     };
-    std::shared_ptr<State> m_state = std::make_shared<State>();
+    std::shared_ptr<State> m_state = xmake_shared<State>();
 };
 
 } // namespace dmq

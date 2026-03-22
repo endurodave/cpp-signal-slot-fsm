@@ -325,13 +325,12 @@ public:
             return BaseType::operator()(std::forward<Args>(args)...);
         } else {
             // Create a clone instance of this delegate 
-            auto delegate = std::shared_ptr<ClassType>(Clone());
+            auto delegate = xmake_shared<ClassType>(*this);
             if (!delegate)
                 BAD_ALLOC();
 
             // Create a new message instance for sending to the destination thread.
-            // If using XALLOCATOR explicit operator new required. See xallocator.h.
-            std::shared_ptr<DelegateAsyncWaitMsg<Args...>> msg(new DelegateAsyncWaitMsg<Args...>(delegate, m_priority, std::forward<Args>(args)...));
+            auto msg = xmake_shared<DelegateAsyncWaitMsg<Args...>>(delegate, m_priority, std::forward<Args>(args)...);
             if (!msg)
                 BAD_ALLOC();
             msg->SetInvokerWaiting(true);
@@ -762,13 +761,12 @@ public:
             return BaseType::operator()(std::forward<Args>(args)...);
         } else {
             // Create a clone instance of this delegate 
-            auto delegate = std::shared_ptr<ClassType>(Clone());
+            auto delegate = xmake_shared<ClassType>(*this);
             if (!delegate)
                 BAD_ALLOC();
 
             // Create a new message instance for sending to the destination thread.
-            // If using XALLOCATOR explicit operator new required. See xallocator.h.
-            std::shared_ptr<DelegateAsyncWaitMsg<Args...>> msg(new DelegateAsyncWaitMsg<Args...>(delegate, m_priority, std::forward<Args>(args)...));
+            auto msg = xmake_shared<DelegateAsyncWaitMsg<Args...>>(delegate, m_priority, std::forward<Args>(args)...);
             if (!msg)
                 BAD_ALLOC();
             msg->SetInvokerWaiting(true);
@@ -1116,13 +1114,12 @@ public:
             return BaseType::operator()(std::forward<Args>(args)...);
         } else {
             // Create a clone instance of this delegate 
-            auto delegate = std::shared_ptr<ClassType>(Clone());
+            auto delegate = xmake_shared<ClassType>(*this);
             if (!delegate)
                 BAD_ALLOC();
 
             // Create a new message instance for sending to the destination thread.
-            // If using XALLOCATOR explicit operator new required. See xallocator.h.
-            std::shared_ptr<DelegateAsyncWaitMsg<Args...>> msg(new DelegateAsyncWaitMsg<Args...>(delegate, m_priority, std::forward<Args>(args)...));
+            auto msg = xmake_shared<DelegateAsyncWaitMsg<Args...>>(delegate, m_priority, std::forward<Args>(args)...);
             if (!msg)
                 BAD_ALLOC();
             msg->SetInvokerWaiting(true);
@@ -1472,13 +1469,12 @@ public:
             return BaseType::operator()(std::forward<Args>(args)...);
         } else {
             // Create a clone instance of this delegate 
-            auto delegate = std::shared_ptr<ClassType>(Clone());
+            auto delegate = xmake_shared<ClassType>(*this);
             if (!delegate)
                 BAD_ALLOC();
 
             // Create a new message instance for sending to the destination thread.
-            // If using XALLOCATOR explicit operator new required. See xallocator.h.
-            std::shared_ptr<DelegateAsyncWaitMsg<Args...>> msg(new DelegateAsyncWaitMsg<Args...>(delegate, m_priority, std::forward<Args>(args)...));
+            auto msg = xmake_shared<DelegateAsyncWaitMsg<Args...>>(delegate, m_priority, std::forward<Args>(args)...);
             if (!msg)
                 BAD_ALLOC();
             msg->SetInvokerWaiting(true);

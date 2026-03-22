@@ -178,11 +178,9 @@ void NetworkEngine::Start()
     if (Thread::GetCurrentThreadId() != m_thread.GetThreadId())
         return MakeDelegate(this, &NetworkEngine::Start, m_thread)();
 
-    static bool bRecvThreadCreated = false;
-
-    if (!bRecvThreadCreated)
+    if (!m_recvThreadCreated)
     {
-        bRecvThreadCreated = true;
+        m_recvThreadCreated = true;
         m_recvThread.CreateThread();
 
         // Post the "RecvThread" loop to run on this new thread.
@@ -249,7 +247,7 @@ void NetworkEngine::RecvThread()
     {
         DmqHeader header;
         // Use a shared_ptr for the stream to efficiently pass data between threads
-        std::shared_ptr<xstringstream> arg_data(new xstringstream(std::ios::in | std::ios::out | std::ios::binary));
+        auto arg_data = xmake_shared<xstringstream>(std::ios::in | std::ios::out | std::ios::binary);
 
         // Block reading from the physical transport
         int error = m_recvTransport.Receive(*arg_data, header);
