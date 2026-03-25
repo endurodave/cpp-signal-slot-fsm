@@ -6,10 +6,7 @@
 #include "DataBusQos.h"
 #include "SpyPacket.h"
 #include "predef/util/Fault.h"
-
-#ifdef _WIN32
-#include "predef/util/WinsockConnect.h"
-#endif
+#include "predef/util/NetworkConnect.h"
 
 #include <string>
 #include <unordered_map>
@@ -317,3 +314,4 @@ private:
 } // namespace dmq
 
 #endif // DMQ_DATABUS_H
+
