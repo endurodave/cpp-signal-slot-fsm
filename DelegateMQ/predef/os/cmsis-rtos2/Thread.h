@@ -13,6 +13,13 @@
 /// asynchronous delegates to a dedicated thread on any CMSIS-compliant RTOS 
 /// (e.g., Keil RTX, FreeRTOS wrapped by CMSIS, Zephyr, etc.).
 ///
+/// @note This implementation is a basic port. For reference, the stdlib and win32
+/// implementations provide additional features:
+/// 1. Priority Support: Uses a priority queue to respect dmq::Priority.
+/// 2. Back Pressure: DispatchDelegate() blocks if the queue is full.
+/// 3. Watchdog: Includes a ThreadCheck() heartbeat mechanism.
+/// 4. Synchronized Startup: CreateThread() blocks until the worker thread is ready.
+///
 /// **Key Features:**
 /// * **Task Integration:** Wraps `osThreadNew` to establish a dedicated worker loop.
 /// * **Queue-Based Dispatch:** Uses `osMessageQueue` to receive and process incoming 
@@ -26,6 +33,7 @@
 #include "cmsis_os2.h"
 #include <string>
 #include <memory>
+#include <atomic>
 
 class ThreadMsg;
 
@@ -60,6 +68,9 @@ public:
 
     std::string GetThreadName() { return THREAD_NAME; }
 
+    /// Get current queue size
+    size_t GetQueueSize();
+
     virtual void DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg) override;
 
 private:
@@ -70,17 +81,17 @@ private:
     static void Process(void* argument);
     void Run();
 
+    const std::string THREAD_NAME;
+    size_t m_queueSize;
+    osPriority_t m_priority;
+
     osThreadId_t m_thread = NULL;
     osMessageQueueId_t m_msgq = NULL;
     osSemaphoreId_t m_exitSem = NULL; // Semaphore to signal thread completion
-    
-    const std::string THREAD_NAME;
+    std::atomic<bool> m_exit = false;
     
     // Configurable sizes
     static const uint32_t STACK_SIZE = 2048; // Bytes
-    
-    size_t m_queueSize;
-    osPriority_t m_priority;
 };
 
 #endif // _THREAD_CMSIS_RTOS2_H

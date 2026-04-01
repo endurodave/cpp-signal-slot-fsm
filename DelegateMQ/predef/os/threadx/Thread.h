@@ -12,6 +12,13 @@
 /// Azure RTOS ThreadX primitives. It enables DelegateMQ to dispatch asynchronous 
 /// delegates to a dedicated ThreadX thread.
 ///
+/// @note This implementation is a basic port. For reference, the stdlib and win32
+/// implementations provide additional features:
+/// 1. Priority Support: Uses a priority queue to respect dmq::Priority.
+/// 2. Back Pressure: DispatchDelegate() blocks if the queue is full.
+/// 3. Watchdog: Includes a ThreadCheck() heartbeat mechanism.
+/// 4. Synchronized Startup: CreateThread() blocks until the worker thread is ready.
+///
 /// **Key Features:**
 /// * **Task Integration:** Wraps `tx_thread_create` to establish a dedicated worker loop.
 /// * **Queue-Based Dispatch:** Uses a `TX_QUEUE` to receive and process incoming 
@@ -26,6 +33,7 @@
 #include <string>
 #include <memory>
 #include <vector>
+#include <atomic>
 
 class ThreadMsg;
 
@@ -69,6 +77,9 @@ public:
     /// Get thread name
     std::string GetThreadName() { return THREAD_NAME; }
 
+    /// Get current queue size
+    size_t GetQueueSize();
+
     // IThread Interface Implementation
     virtual void DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg) override;
 
@@ -82,23 +93,23 @@ private:
     // Run loop called by Process
     void Run();
 
+    const std::string THREAD_NAME;
+    size_t m_queueSize; // Stored queue size
+    UINT m_priority;    // Stored priority
+
     // ThreadX Control Blocks
     TX_THREAD m_thread;
     TX_QUEUE m_queue;
     TX_SEMAPHORE m_exitSem; // Semaphore to signal thread completion
+    std::atomic<bool> m_exit = false;
 
     // Memory buffers required by ThreadX (Managed by RAII)
     // Using ULONG[] ensures correct alignment for ThreadX stacks and queues
     std::unique_ptr<ULONG[]> m_stackMemory;
     std::unique_ptr<ULONG[]> m_queueMemory;
     
-    const std::string THREAD_NAME;
-    
     // Configurable stack size (bytes)
     static const ULONG STACK_SIZE = 2048; 
-    
-    size_t m_queueSize; // Stored queue size
-    UINT m_priority;    // Stored priority
 };
 
 #endif // _THREAD_THREADX_H
