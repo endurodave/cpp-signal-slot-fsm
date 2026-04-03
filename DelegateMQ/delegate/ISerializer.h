@@ -21,7 +21,7 @@ namespace dmq {
     /// into a byte stream (for network transport) and back again. 
     ///
     /// Users must implement this interface for the specific function signatures they intend to call 
-    /// remotely, OR use one of the pre-defined serializers provided in `predef/serialize` 
+    /// remotely, OR use one of the pre-defined serializers provided in `port/serialize`
     /// (e.g., MessagePack, JSON, Cereal).
     /// 
     /// @tparam RetType The return type of the function signature.
@@ -39,7 +39,7 @@ namespace dmq {
         /// @param[out] os The output stream (buffer) to write data to.
         /// @param[in] args The actual arguments passed to the delegate invocation.
         /// @return Reference to the output stream.
-        virtual std::ostream& Write(std::ostream& os, Args... args) = 0;
+        virtual std::ostream& Write(std::ostream& os, const Args&... args) = 0;
 
         /// @brief Deserializes data from the input stream into function arguments.
         /// 
