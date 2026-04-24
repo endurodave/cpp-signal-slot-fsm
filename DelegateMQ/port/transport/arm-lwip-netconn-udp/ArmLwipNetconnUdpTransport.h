@@ -32,6 +32,8 @@
 #include <sstream>
 #include <cstring>
 
+namespace dmq::transport {
+
 class NetconnUdpTransport : public ITransport
 {
 public:
@@ -100,6 +102,14 @@ public:
         {
             netconn_delete(m_conn);
             m_conn = nullptr;
+        }
+    }
+
+    void SetRecvTimeout(std::chrono::milliseconds timeout)
+    {
+        if (m_conn)
+        {
+            netconn_set_recvtimeout(m_conn, static_cast<int>(timeout.count()));
         }
     }
 
@@ -249,5 +259,7 @@ private:
     ITransport* m_recvTransport = nullptr;
     ITransportMonitor* m_transportMonitor = nullptr;
 };
+
+}
 
 #endif // ARM_LWIP_NETCONN_UDP_TRANSPORT_H

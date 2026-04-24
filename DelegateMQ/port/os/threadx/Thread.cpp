@@ -2,6 +2,7 @@
 #error "port/os/threadx/Thread.cpp requires DMQ_THREAD_THREADX. Remove this file from your build configuration or define DMQ_THREAD_THREADX."
 #endif
 
+#include "DelegateMQ.h"
 #include "Thread.h"
 #include "ThreadMsg.h"
 #include <cstdio>
@@ -13,18 +14,20 @@
 #define ASSERT_TRUE(x) if(!(x)) { while(1); } // Replace with your fault handler
 #endif
 
+namespace dmq::os {
+
 using namespace dmq;
+using namespace dmq::util;
 
 //----------------------------------------------------------------------------
 // Thread Constructor
 //----------------------------------------------------------------------------
-Thread::Thread(const std::string& threadName, size_t maxQueueSize)
+Thread::Thread(const std::string& threadName, size_t maxQueueSize, FullPolicy fullPolicy)
     : THREAD_NAME(threadName)
+    , m_queueSize((maxQueueSize == 0) ? DEFAULT_QUEUE_SIZE : maxQueueSize)
+    , FULL_POLICY(fullPolicy)
     , m_exit(false)
 {
-    // If 0 is passed, use the default size
-    m_queueSize = (maxQueueSize == 0) ? DEFAULT_QUEUE_SIZE : maxQueueSize;
-
     // Zero out control blocks for safety
     memset(&m_thread, 0, sizeof(m_thread));
     memset(&m_queue, 0, sizeof(m_queue));
@@ -50,7 +53,7 @@ Thread::~Thread()
 //----------------------------------------------------------------------------
 // CreateThread
 //----------------------------------------------------------------------------
-bool Thread::CreateThread()
+bool Thread::CreateThread(std::optional<dmq::Duration> watchdogTimeout)
 {
     // Check if thread is already created (tx_thread_id is non-zero if created)
     if (m_thread.tx_thread_id == 0)
@@ -109,6 +112,23 @@ bool Thread::CreateThread()
         }
 
         ASSERT_TRUE(ret == TX_SUCCESS);
+
+        m_lastAliveTime.store(Timer::GetNow());
+
+        if (watchdogTimeout.has_value())
+        {
+            m_watchdogTimeout = watchdogTimeout.value();
+
+            m_threadTimer = std::unique_ptr<Timer>(new Timer());
+            m_threadTimerConn = m_threadTimer->OnExpired.Connect(
+                MakeDelegate(this, &Thread::ThreadCheck, *this));
+            m_threadTimer->Start(m_watchdogTimeout.load() / 4);
+
+            m_watchdogTimer = std::unique_ptr<Timer>(new Timer());
+            m_watchdogTimerConn = m_watchdogTimer->OnExpired.Connect(
+                MakeDelegate(this, &Thread::WatchdogCheck));
+            m_watchdogTimer->Start(m_watchdogTimeout.load() / 2);
+        }
     }
     return true;
 }
@@ -142,6 +162,17 @@ void Thread::ExitThread()
 {
     if (m_queue.tx_queue_id != 0)
     {
+        if (m_watchdogTimer)
+        {
+            m_watchdogTimer->Stop();
+            m_watchdogTimerConn.Disconnect();
+        }
+        if (m_threadTimer)
+        {
+            m_threadTimer->Stop();
+            m_threadTimerConn.Disconnect();
+        }
+
         m_exit.store(true);
 
         // Send exit message
@@ -220,6 +251,15 @@ size_t Thread::GetQueueSize()
     return 0;
 }
 
+void Thread::Sleep(dmq::Duration timeout) {
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(timeout).count();
+    // Assuming 100 ticks per second (10ms per tick) as a common default.
+    // Ideally use TX_TIMER_TICKS_PER_SECOND if defined.
+    ULONG ticks = (static_cast<ULONG>(ms) * TX_TIMER_TICKS_PER_SECOND) / 1000;
+    if (ticks == 0 && ms > 0) ticks = 1;
+    tx_thread_sleep(ticks);
+}
+
 //----------------------------------------------------------------------------
 // DispatchDelegate
 //----------------------------------------------------------------------------
@@ -236,13 +276,25 @@ void Thread::DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg)
         return;
     }
 
-    // Send pointer to queue. Wait 10 ticks if full.
-    UINT ret = tx_queue_send(&m_queue, &threadMsg, 10);
+    // Send pointer to queue
+    // Set wait option based on FullPolicy: TX_WAIT_FOREVER for BLOCK, TX_NO_WAIT for DROP/FAULT.
+    UINT wait_option = (FULL_POLICY == FullPolicy::BLOCK) ? TX_WAIT_FOREVER : TX_NO_WAIT;
+
+    // Option #2: Implement High priority using tx_queue_front_send.
+    UINT ret;
+    if (msg->GetPriority() == Priority::HIGH)
+        ret = tx_queue_front_send(&m_queue, &threadMsg, wait_option);
+    else
+        ret = tx_queue_send(&m_queue, &threadMsg, wait_option);
 
     if (ret != TX_SUCCESS)
     {
+        if (FULL_POLICY == FullPolicy::FAULT)
+        {
+            printf("[Thread] CRITICAL: Queue full on thread '%s'! TRIGGERING FAULT.\n", THREAD_NAME.c_str());
+            ASSERT_TRUE(ret == TX_SUCCESS);
+        }
         delete threadMsg; // Failed to enqueue, prevent leak
-        // Optional: printf("Error: Thread '%s' queue full!\n", THREAD_NAME.c_str());
     }
 }
 
@@ -263,11 +315,35 @@ void Thread::Process(ULONG instance)
 //----------------------------------------------------------------------------
 // Run (Member Function Loop)
 //----------------------------------------------------------------------------
+//----------------------------------------------------------------------------
+// WatchdogCheck
+//----------------------------------------------------------------------------
+void Thread::WatchdogCheck()
+{
+    auto now = Timer::GetNow();
+    auto lastAlive = m_lastAliveTime.load();
+    auto delta = now - lastAlive;
+    if (delta > m_watchdogTimeout.load())
+    {
+        // @TODO trigger recovery or fault handler
+    }
+}
+
+//----------------------------------------------------------------------------
+// ThreadCheck
+//----------------------------------------------------------------------------
+void Thread::ThreadCheck()
+{
+    m_lastAliveTime.store(Timer::GetNow());
+}
+
 void Thread::Run()
 {
     ThreadMsg* msg = nullptr;
     while (!m_exit.load())
     {
+        m_lastAliveTime.store(Timer::GetNow());
+
         // Block forever waiting for a message
         UINT ret = tx_queue_receive(&m_queue, &msg, TX_WAIT_FOREVER);
         if (ret != TX_SUCCESS) continue;
@@ -295,3 +371,5 @@ void Thread::Run()
     // Signal ExitThread() that the loop has exited
     tx_semaphore_put(&m_exitSem);
 }
+
+} // namespace dmq::os

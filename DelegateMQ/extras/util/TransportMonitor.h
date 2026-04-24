@@ -2,11 +2,15 @@
 #define _TRANSPORT_MONITOR_HH
 
 #include "delegate/DelegateOpt.h"
+#include "delegate/Signal.h"
 #include "../../port/transport/ITransportMonitor.h"
 #include <map>
 #include <cstdint>
 #include <chrono>
 #include <vector>
+#include <iostream>
+
+namespace dmq::util {
 
 /// @brief A thread-safe monitor for tracking outgoing remote messages and detecting timeouts.
 /// 
@@ -26,7 +30,7 @@
 /// This class relies on a cooperative polling model. The `Process()` method must be called 
 /// periodically (typically by a background timer or the network thread loop) to scan for 
 /// and handle expired messages.
-class TransportMonitor : public ITransportMonitor
+class TransportMonitor : public dmq::transport::ITransportMonitor
 {
 public:
     enum class Status
@@ -39,7 +43,7 @@ public:
     /// Subscribers receive: (remoteId, seqNum, status)
     dmq::Signal<void(dmq::DelegateRemoteId, uint16_t, Status)> OnSendStatus;
 
-    TransportMonitor(const dmq::Duration timeout) : TRANSPORT_TIMEOUT(timeout)
+    TransportMonitor(const dmq::Duration timeout = std::chrono::seconds(2)) : TRANSPORT_TIMEOUT(timeout)
     {
     }
 
@@ -112,9 +116,6 @@ public:
         // Meanwhile Thread B -> Send -> Add(Wait for Lock A)
         for (const auto& item : expiredItems)
         {
-            // Simple logging to console
-            // Note: std::cerr is generally safe, but on embedded might be redirected or empty.
-            std::cerr << "TransportMonitor::Process TIMEOUT RemoteID: " << item.data.remoteId << " Seq: " << item.seq << std::endl;
             OnSendStatus(item.data.remoteId, item.seq, Status::TIMEOUT);
         }
     }
@@ -130,5 +131,8 @@ private:
     const dmq::Duration TRANSPORT_TIMEOUT;
     dmq::RecursiveMutex m_lock;
 };
+
+} // namespace dmq::util
+
 
 #endif

@@ -6,8 +6,7 @@
 #include "task.h" 
 #include <chrono>
 
-namespace dmq
-{
+namespace dmq::os {
     /// @brief Production-grade wrapper around FreeRTOS Semaphore to mimic std::condition_variable
     /// @details 
     /// - Uses a Binary Semaphore (1 token).
@@ -71,11 +70,15 @@ namespace dmq
         {
             while (!pred())
             {
-                lock.unlock();
+                if (lock.owns_lock())
+                    lock.unlock();
+
                 // Wait indefinitely
                 BaseType_t ret = xSemaphoreTake(m_sem, portMAX_DELAY);
                 configASSERT(ret == pdTRUE);
-                lock.lock();
+
+                if (!lock.owns_lock())
+                    lock.lock();
             }
         }
 
@@ -95,16 +98,22 @@ namespace dmq
                 TickType_t elapsed = now - start;
 
                 if (elapsed >= timeoutTicks)
+                {
+                    if (!lock.owns_lock())
+                        lock.lock();
                     return pred(); // Timeout expired, check predicate one last time
+                }
 
                 TickType_t remaining = timeoutTicks - elapsed;
 
-                lock.unlock();
+                if (lock.owns_lock())
+                    lock.unlock();
                 
                 // Wait for the semaphore or timeout
                 BaseType_t res = xSemaphoreTake(m_sem, remaining);
                 
-                lock.lock();
+                if (!lock.owns_lock())
+                    lock.lock();
 
                 if (res == pdFALSE)
                 {
@@ -122,6 +131,6 @@ namespace dmq
     private:
         SemaphoreHandle_t m_sem = NULL;
     };
-}
+} // namespace dmq::os
 
 #endif // FREERTOS_CONDITION_VARIABLE_H

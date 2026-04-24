@@ -1,7 +1,11 @@
 #ifndef DMQ_DATABUS_H
 #define DMQ_DATABUS_H
 
-#include "DelegateMQ.h"
+#include "delegate/Signal.h"
+#include "delegate/DelegateRemote.h"
+#include "delegate/DelegateAsync.h"
+#include "delegate/IThread.h"
+#include "delegate/DelegateOpt.h"
 #include "Participant.h"
 #include "DataBusQos.h"
 #include "SpyPacket.h"
@@ -17,7 +21,7 @@
 #include <typeindex>
 #include <atomic>
 
-namespace dmq {
+namespace dmq::databus {
 
 // The DataBus is a central registry for topic-based communication.
 // It allows components to publish and subscribe to data topics identified by strings.
@@ -81,7 +85,13 @@ public:
         GetInstance().InternalRegisterStringifier<T>(topic, std::move(func));
     }
 
+    // Enable/Disable Last Value Cache (LVC) for a topic.
+    static void LastValueCache(const std::string& topic, bool enabled) {
+        GetInstance().InternalLastValueCache(topic, enabled);
+    }
+
     // Subscribe to all bus traffic (topic and stringified value).
+    // Monitor all traffic on the DataBus.
     // NOTE: priority is only applied when thread != nullptr; passing a non-default
     // priority without a thread is a programming error and triggers FaultHandler.
     static dmq::ScopedConnection Monitor(std::function<void(const SpyPacket&)> func, dmq::IThread* thread = nullptr, dmq::Priority priority = dmq::Priority::NORMAL) {
@@ -99,12 +109,22 @@ public:
         return instance.m_monitorSignal.Connect(dmq::MakeDelegate(std::move(func)));
     }
 
+    /// Fired when a message is published but has no local or remote subscribers.
+    static dmq::ScopedConnection SubscribeUnhandled(std::function<void(const std::string& topic)> func) {
+        return GetInstance().m_unhandledSignal.Connect(dmq::MakeDelegate(std::move(func)));
+    }
+
     // Reset the DataBus (mostly for testing).
     static void ResetForTesting() {
         GetInstance().InternalReset();
     }
 
 private:
+    void InternalLastValueCache(const std::string& topic, bool enabled) {
+        std::lock_guard<dmq::RecursiveMutex> lock(m_mutex);
+        m_topicQos[topic].lastValueCache = enabled;
+    }
+
     DataBus() = default;
     ~DataBus() = default;
 
@@ -225,7 +245,7 @@ private:
             // Must be first — before any writes — so a mismatch never corrupts LVC.
             auto itType = m_typeIndices.find(topic);
             if (itType != m_typeIndices.end() && itType->second != std::type_index(typeid(T))) {
-                ::FaultHandler(__FILE__, (unsigned short)__LINE__);
+                ::dmq::util::FaultHandler(__FILE__, (unsigned short)__LINE__);
                 return;
             }
 
@@ -271,15 +291,23 @@ private:
         }
 
         // 7. Local distribution
+        bool handled = false;
         if (signal) {
             (*signal)(data);
+            handled = true;
         }
 
         // 8. Remote distribution using the snapshot
         if (serializer) {
             for (auto& participant : participantsSnapshot) {
                 participant->Send<T>(topic, data, *serializer);
+                handled = true;
             }
+        }
+
+        // 9. Notify if no one received the message
+        if (!handled) {
+            m_unhandledSignal(topic);
         }
     }
 
@@ -295,7 +323,7 @@ private:
         auto itType = m_typeIndices.find(topic);
         if (itType != m_typeIndices.end()) {
             if (itType->second != std::type_index(typeid(T))) {
-                ::FaultHandler(__FILE__, (unsigned short)__LINE__);
+                ::dmq::util::FaultHandler(__FILE__, (unsigned short)__LINE__);
                 return;
             }
         } else {
@@ -314,7 +342,7 @@ private:
         auto itType = m_typeIndices.find(topic);
         if (itType != m_typeIndices.end()) {
             if (itType->second != std::type_index(typeid(T))) {
-                ::FaultHandler(__FILE__, (unsigned short)__LINE__);
+                ::dmq::util::FaultHandler(__FILE__, (unsigned short)__LINE__);
                 return;
             }
         } else {
@@ -347,7 +375,7 @@ private:
         if (itType != m_typeIndices.end()) {
             if (itType->second != std::type_index(typeid(T))) {
                 // Runtime Type Safety: Catch same topic string used with different types
-                ::FaultHandler(__FILE__, (unsigned short)__LINE__);
+                ::dmq::util::FaultHandler(__FILE__, (unsigned short)__LINE__);
                 return nullptr; 
             }
         } else {
@@ -378,9 +406,11 @@ private:
     std::unordered_map<std::string, QoS> m_topicQos;
     std::unordered_map<std::string, std::shared_ptr<void>> m_stringifiers;
     dmq::Signal<void(const SpyPacket&)> m_monitorSignal;
+    dmq::Signal<void(const std::string& topic)> m_unhandledSignal;
 };
 
-} // namespace dmq
+} // namespace dmq::databus
+
 
 #endif // DMQ_DATABUS_H
 

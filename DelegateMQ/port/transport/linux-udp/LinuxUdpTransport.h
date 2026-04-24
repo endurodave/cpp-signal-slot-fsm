@@ -39,8 +39,10 @@
 #include <fcntl.h>
 #include <errno.h>
 
+namespace dmq::transport {
+
 // Linux UDP transport example
-class UdpTransport : public ITransport
+class LinuxUdpTransport : public ITransport
 {
 public:
     enum class Type
@@ -49,11 +51,11 @@ public:
         SUB
     };
 
-    UdpTransport() : m_sendTransport(this), m_recvTransport(this)
+    LinuxUdpTransport() : m_sendTransport(this), m_recvTransport(this)
     {
     }
 
-    ~UdpTransport()
+    ~LinuxUdpTransport()
     {
         Close();
     }
@@ -126,6 +128,17 @@ public:
             shutdown(m_socket, SHUT_RDWR);
             close(m_socket);
             m_socket = -1;
+        }
+    }
+
+    void SetRecvTimeout(std::chrono::milliseconds timeout)
+    {
+        if (m_socket != -1)
+        {
+            struct timeval tv;
+            tv.tv_sec = timeout.count() / 1000;
+            tv.tv_usec = (timeout.count() % 1000) * 1000;
+            setsockopt(m_socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         }
     }
 
@@ -297,5 +310,9 @@ private:
     static const int BUFFER_SIZE = 4096;
     char m_buffer[BUFFER_SIZE] = { 0 };
 };
+
+using UdpTransport = LinuxUdpTransport;
+
+} // namespace dmq::transport
 
 #endif // LINUX_UDP_TRANSPORT_H

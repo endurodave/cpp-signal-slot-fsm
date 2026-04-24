@@ -7,37 +7,70 @@
 /// @note This implementation is a basic port. For reference, the stdlib and win32
 /// implementations provide additional features:
 /// 1. Priority Support: Uses a priority queue to respect dmq::Priority.
-/// 2. Back Pressure: DispatchDelegate() blocks if the queue is full.
-/// 3. Watchdog: Includes a ThreadCheck() heartbeat mechanism.
-/// 4. Synchronized Startup: CreateThread() blocks until the worker thread is ready.
+/// 2. Synchronized Startup: CreateThread() blocks until the worker thread is ready.
+///
+/// **Key Features:**
+/// * **QThread Integration:** Wraps `QThread` and uses a Worker object to execute
+///   delegates in the target thread's event loop.
+/// * **FullPolicy Support:** Configurable back-pressure (BLOCK or DROP) using
+///   `QMutex` and `QWaitCondition`.
+/// * **Signal/Slot Dispatch:** Uses Qt's meta-object system to bridge delegate
+///   execution across thread boundaries.
+/// * **Watchdog Integration:** Optional heartbeat mechanism detects stalled or deadlocked
+///   threads. Enable by passing a timeout to CreateThread(). Requires
+///   Timer::ProcessTimers() to be called from a context that can preempt watched threads
+///   — typically a hardware timer ISR or the highest-priority task in the system.
 ///
 #include "delegate/IThread.h"
+#include "extras/util/Timer.h"
 #include <QThread>
 #include <QObject>
 #include <QMutex>
 #include <QWaitCondition>
 #include <memory>
 #include <string>
+#include <optional>
 
 // Ensure DelegateMsg is known to Qt MetaType system
 Q_DECLARE_METATYPE(std::shared_ptr<dmq::DelegateMsg>)
 
+namespace dmq::os {
+
 class Worker;
+
+/// @brief Policy applied when the thread message queue is full.
+/// @details Only meaningful when maxQueueSize > 0.
+///   - BLOCK: DispatchDelegate() blocks the caller until space is available (back pressure).
+///   - DROP:  DispatchDelegate() silently discards the message and returns immediately.
+///   - FAULT: DispatchDelegate() triggers a system fault if the queue is full.
+///
+/// Use DROP for high-rate best-effort topics (sensor telemetry, display updates) where
+/// a stale sample is preferable to stalling the publisher. Use BLOCK for critical topics
+/// (commands, state transitions) where no message may be lost. FAULT is the default.
+enum class FullPolicy { BLOCK, DROP, FAULT };
 
 class Thread : public QObject, public dmq::IThread
 {
     Q_OBJECT
 
 public:
+    /// Default queue size if 0 is passed
+    static const size_t DEFAULT_QUEUE_SIZE = 20;
+
     /// Constructor
     /// @param threadName Name for debugging (QObject::objectName)
-    Thread(const std::string& threadName);
+    /// @param maxQueueSize Max number of messages in queue (0 = Default 20)
+    /// @param fullPolicy Action when queue is full: FAULT (default), BLOCK or DROP.
+    Thread(const std::string& threadName, size_t maxQueueSize = 0, FullPolicy fullPolicy = FullPolicy::FAULT);
 
     /// Destructor
     ~Thread();
 
-    /// Create and start the internal QThread
-    bool CreateThread();
+    /// Create and start the internal QThread. If watchdogTimeout value
+    /// provided, the maximum watchdog interval is used. Otherwise no watchdog.
+    /// @param[in] watchdogTimeout - optional watchdog timeout.
+    /// @return TRUE if thread is created. FALSE otherwise.
+    bool CreateThread(std::optional<dmq::Duration> watchdogTimeout = std::nullopt);
 
     /// Stop the QThread
     void ExitThread();
@@ -56,6 +89,10 @@ public:
     /// Get current queue size
     size_t GetQueueSize() const { return m_queueSize.load(); }
 
+    /// Sleep for a duration.
+    /// @param[in] timeout - the duration to sleep.
+    static void Sleep(dmq::Duration timeout);
+
     // IThread Interface Implementation
     virtual void DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg) override;
 
@@ -64,16 +101,37 @@ signals:
     void SignalDispatch(std::shared_ptr<dmq::DelegateMsg> msg);
 
 private slots:
-    void OnMessageProcessed() { m_queueSize--; }
+    void OnMessageProcessed() { 
+        m_queueSize--; 
+        m_cvNotFull.wakeAll();
+    }
 
 private:
     Thread(const Thread&) = delete;
     Thread& operator=(const Thread&) = delete;
 
-    std::string m_threadName;
+    /// Check watchdog is expired. Called from Timer::ProcessTimers() context.
+    void WatchdogCheck();
+
+    /// Timer expiration function dispatched to this thread to update m_lastAliveTime.
+    void ThreadCheck();
+
+    const std::string m_threadName;
+    const size_t m_maxQueueSize;
+    const FullPolicy m_fullPolicy;
     QThread* m_thread = nullptr;
     Worker* m_worker = nullptr;
     std::atomic<size_t> m_queueSize{0};
+    QMutex m_mutex;
+    QWaitCondition m_cvNotFull;
+
+    // Watchdog related members
+    std::atomic<dmq::TimePoint> m_lastAliveTime;
+    std::unique_ptr<Timer> m_watchdogTimer;
+    dmq::ScopedConnection m_watchdogTimerConn;
+    std::unique_ptr<Timer> m_threadTimer;
+    dmq::ScopedConnection m_threadTimerConn;
+    std::atomic<dmq::Duration> m_watchdogTimeout;
 };
 
 // ----------------------------------------------------------------------------
@@ -98,5 +156,7 @@ public slots:
         emit MessageProcessed();
     }
 };
+
+} // namespace dmq::os
 
 #endif // _QT_THREAD_H

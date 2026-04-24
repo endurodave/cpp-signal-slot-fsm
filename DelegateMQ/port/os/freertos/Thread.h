@@ -14,22 +14,27 @@
 ///
 /// @note This implementation is a basic port. For reference, the stdlib and win32
 /// implementations provide additional features:
-/// 1. Priority Support: Uses a priority queue to respect dmq::Priority.
-/// 2. Back Pressure: DispatchDelegate() blocks if the queue is full.
-/// 3. Watchdog: Includes a ThreadCheck() heartbeat mechanism.
-/// 4. Synchronized Startup: CreateThread() blocks until the worker thread is ready.
+/// 1. Synchronized Startup: CreateThread() blocks until the worker thread is ready.
 ///
 /// **Key Features:**
 /// * **Task Integration:** Wraps a FreeRTOS `xTaskCreate` call to establish a
 ///   dedicated worker loop.
+/// * **FullPolicy Support:** Configurable back-pressure (BLOCK or DROP) when the
+///   message queue is full.
+/// * **Priority Support:** Normal and High priorities (uses `xQueueSendToFront`).
 /// * **Queue-Based Dispatch:** Uses a FreeRTOS `QueueHandle_t` to receive and
 ///   process incoming delegate messages in a thread-safe manner.
 /// * **Thread Identification:** Implements `GetThreadId()` using `TaskHandle_t`
 ///   to ensure correct thread context checks (used by `AsyncInvoke` optimizations).
 /// * **Graceful Shutdown:** Provides mechanisms (`ExitThread`) to cleanup resources,
 ///   though typical embedded tasks often run forever.
+/// * **Watchdog Integration:** Optional heartbeat mechanism detects stalled or deadlocked
+///   threads. Enable by passing a timeout to CreateThread(). Requires
+///   Timer::ProcessTimers() to be called from a context that can preempt watched threads
+///   — typically a hardware timer ISR or the highest-priority task in the system.
 
 #include "delegate/IThread.h"
+#include "extras/util/Timer.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include "queue.h"
@@ -37,8 +42,22 @@
 #include <string>
 #include <memory>
 #include <atomic>
+#include <optional>
+
+namespace dmq::os {
 
 class ThreadMsg;
+
+/// @brief Policy applied when the FreeRTOS task queue is full.
+/// @details Controls the behavior of DispatchDelegate() when the queue has no space.
+///   - DROP:  xQueueSend() with timeout 0 — returns immediately, message discarded.
+///   - BLOCK: xQueueSend() with portMAX_DELAY — caller blocks until space is available.
+///   - FAULT: xQueueSend() with timeout 0 - returns immediately, triggers a system fault if queue full.
+///
+/// FAULT is the default. For embedded targets where the
+/// caller may be an ISR or high-priority task, consider using DROP to avoid
+/// priority inversion or blocking at an unsafe context.
+enum class FullPolicy { BLOCK, DROP, FAULT };
 
 class Thread : public dmq::IThread
 {
@@ -49,14 +68,17 @@ public:
     /// Constructor
     /// @param threadName Name for the FreeRTOS task
     /// @param maxQueueSize Max number of messages in queue (0 = Default 20)
-    Thread(const std::string& threadName, size_t maxQueueSize = 0);
+    /// @param fullPolicy Action when queue is full: FAULT (default), BLOCK or DROP.
+    Thread(const std::string& threadName, size_t maxQueueSize = 0, FullPolicy fullPolicy = FullPolicy::FAULT);
 
     /// Destructor
     ~Thread();
 
-    /// Called once to create the worker thread
-    /// @return TRUE if thread is created. FALSE otherwise. 
-    bool CreateThread();
+    /// Called once to create the worker thread. If watchdogTimeout value
+    /// provided, the maximum watchdog interval is used. Otherwise no watchdog.
+    /// @param[in] watchdogTimeout - optional watchdog timeout.
+    /// @return TRUE if thread is created. FALSE otherwise.
+    bool CreateThread(std::optional<dmq::Duration> watchdogTimeout = std::nullopt);
 
     /// Returns true if the thread is created
     bool IsThreadCreated() const { return m_thread != nullptr; }
@@ -79,6 +101,10 @@ public:
     /// Get current queue size
     size_t GetQueueSize();
 
+    /// Sleep for a duration.
+    /// @param[in] timeout - the duration to sleep.
+    static void Sleep(dmq::Duration timeout);
+
     /// Set the FreeRTOS Task Priority.
     /// Can be called before or after CreateThread().
     /// @param priority FreeRTOS priority level (0 to configMAX_PRIORITIES-1)
@@ -92,6 +118,11 @@ public:
     // IThread Interface Implementation
     virtual void DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg) override;
 
+    /// Update the last alive time for the watchdog. 
+    /// @details Normally called automatically by internal timers. For threads with 
+    /// blocking loops (e.g. Network receiver), call this manually to prevent timeouts.
+    void ThreadCheck();
+
 private:
     Thread(const Thread&) = delete;
     Thread& operator=(const Thread&) = delete;
@@ -102,7 +133,11 @@ private:
     // Run loop called by Process
     void Run();
 
+    /// Check watchdog is expired. Called from Timer::ProcessTimers() context.
+    void WatchdogCheck();
+
     const std::string THREAD_NAME;
+    const FullPolicy FULL_POLICY;
     size_t m_queueSize;
     int m_priority;
 
@@ -115,6 +150,18 @@ private:
     StackType_t* m_stackBuffer = nullptr;
     uint32_t m_stackSize = 1024; // Default size (words)
     StaticTask_t m_tcb;          // TCB storage for static creation
+
+    // Watchdog related members
+    dmq::TimePoint m_lastAliveTime;
+    std::unique_ptr<dmq::util::Timer> m_watchdogTimer;
+    dmq::ScopedConnection m_watchdogTimerConn;
+    std::unique_ptr<dmq::util::Timer> m_threadTimer;
+    dmq::ScopedConnection m_threadTimerConn;
+    dmq::Duration m_watchdogTimeout;
+    dmq::RecursiveMutex m_watchdogMtx;
 };
+
+} // namespace dmq::os
+
 
 #endif

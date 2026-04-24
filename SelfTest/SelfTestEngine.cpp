@@ -47,7 +47,7 @@ void SelfTestEngine::InvokeStatusSignal(std::string msg)
 void SelfTestEngine::Start(const StartData* data)
 {
     // Is the caller executing on m_thread?
-    if (m_thread.GetThreadId() != Thread::GetCurrentThreadId())
+    if (m_thread.GetThreadId() != dmq::os::Thread::GetCurrentThreadId())
     {
         // Create an asynchronous delegate and reinvoke the function call on m_thread
         auto delegate = MakeDelegate(this, &SelfTestEngine::Start, m_thread);

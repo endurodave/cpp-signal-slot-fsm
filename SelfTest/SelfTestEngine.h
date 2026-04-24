@@ -25,7 +25,7 @@ public:
     // Start the self-tests. This is a thread-safe asynchronous function. 
     void Start(const StartData* data);
 
-    Thread& GetThread() { return m_thread; }
+    dmq::os::Thread& GetThread() { return m_thread; }
     static void InvokeStatusSignal(std::string msg);
 
 private:
@@ -37,7 +37,7 @@ private:
     PressureTest m_pressureTest;
 
     // Worker thread used by all self-tests
-    Thread m_thread;
+    dmq::os::Thread m_thread;
 
     StartData m_startData;
 

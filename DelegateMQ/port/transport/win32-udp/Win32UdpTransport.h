@@ -37,8 +37,10 @@
 #include <sstream>
 #include <cstdio>
 
+namespace dmq::transport {
+
 /// @brief Win32 UDP transport example. 
-class UdpTransport : public ITransport
+class Win32UdpTransport : public ITransport
 {
 public:
     enum class Type
@@ -47,11 +49,11 @@ public:
         SUB
     };
 
-    UdpTransport() : m_sendTransport(this), m_recvTransport(this)
+    Win32UdpTransport() : m_sendTransport(this), m_recvTransport(this)
     {
     }
 
-    ~UdpTransport()
+    ~Win32UdpTransport()
     {
         Close();
     }
@@ -95,7 +97,8 @@ public:
             int err = ::bind(m_socket, (sockaddr*)&m_addr, sizeof(m_addr));
             if (err == SOCKET_ERROR)
             {
-                std::cerr << "Bind failed: " << err << std::endl;
+                int wsaErr = WSAGetLastError();
+                std::cerr << "Win32UdpTransport: Bind failed on port " << port << ". Error: " << wsaErr << std::endl;
                 return -1;
             }
 
@@ -124,7 +127,16 @@ public:
         }
     }
 
-    virtual int Send(xostringstream& os, const DmqHeader& header) override
+    void SetRecvTimeout(std::chrono::milliseconds timeout)
+    {
+        if (m_socket != INVALID_SOCKET)
+        {
+            DWORD ms = static_cast<DWORD>(timeout.count());
+            setsockopt(m_socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&ms, sizeof(ms));
+        }
+    }
+
+    virtual int Send(dmq::xostringstream& os, const DmqHeader& header) override
     {
         if (os.bad() || os.fail()) {
             std::cout << "Error: xostringstream is in a bad state!" << std::endl;
@@ -152,7 +164,7 @@ public:
         }
         headerCopy.SetLength(static_cast<uint16_t>(payload.length()));
 
-        xostringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+        dmq::xostringstream ss(std::ios::in | std::ios::out | std::ios::binary);
 
         // Convert to Network Byte Order (Big Endian)
         uint16_t marker = htons(headerCopy.GetMarker());
@@ -170,6 +182,12 @@ public:
 
         int err = sendto(m_socket, data.c_str(), (int)data.size(), 0, (sockaddr*)&m_addr, sizeof(m_addr));
 
+        if (err != SOCKET_ERROR) {
+            // std::cout << "Win32UdpTransport: Sent " << data.size() << " bytes to remote ID " << headerCopy.GetId() << std::endl;
+        } else {
+            std::cerr << "Win32UdpTransport: ERROR - sendto failed with " << WSAGetLastError() << std::endl;
+        }
+
         // Always track the message (unless it is an ACK)
         // Use Host Byte Order for ID check
         if (err != SOCKET_ERROR && headerCopy.GetId() != dmq::ACK_REMOTE_ID && m_transportMonitor) {
@@ -179,14 +197,14 @@ public:
         return (err == SOCKET_ERROR) ? -1 : 0;
     }
 
-    virtual int Receive(xstringstream& is, DmqHeader& header) override
+    virtual int Receive(dmq::xstringstream& is, DmqHeader& header) override
     {
         if (m_recvTransport != this) {
             std::cout << "Error: This transport used for send only!" << std::endl;
             return -1;
         }
 
-        xstringstream headerStream(std::ios::in | std::ios::out | std::ios::binary);
+        dmq::xstringstream headerStream(std::ios::in | std::ios::out | std::ios::binary);
 
         int addrLen = sizeof(m_addr);
         int size = recvfrom(m_socket, m_buffer, sizeof(m_buffer), 0, (sockaddr*)&m_addr, &addrLen);
@@ -237,7 +255,7 @@ public:
         {
             if (m_transportMonitor && m_sendTransport)
             {
-                xostringstream ss_ack;
+                dmq::xostringstream ss_ack;
                 DmqHeader ack;
                 ack.SetId(dmq::ACK_REMOTE_ID);
                 ack.SetSeqNum(seqNum);
@@ -281,5 +299,10 @@ private:
     static const int BUFFER_SIZE = 4096;
     char m_buffer[BUFFER_SIZE] = { 0 };
 };
+
+using UdpTransport = Win32UdpTransport;
+
+} // namespace dmq::transport
+
 
 #endif

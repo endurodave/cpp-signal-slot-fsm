@@ -2,9 +2,9 @@
 #error "port/os/win32/Thread.cpp is Windows-only and must not be compiled on non-Windows targets. Remove this file from your build configuration."
 #endif
 
-#include "DelegateMQ.h"
-#include "Thread.h"
-#include "extras/util/Fault.h"
+namespace dmq::os {
+
+using namespace dmq::util;
 
 #define MSG_DISPATCH_DELEGATE    1
 #define MSG_EXIT_THREAD          2
@@ -12,9 +12,10 @@
 //----------------------------------------------------------------------------
 // Thread
 //----------------------------------------------------------------------------
-Thread::Thread(const std::string& threadName, size_t maxQueueSize)
+Thread::Thread(const std::string& threadName, size_t maxQueueSize, FullPolicy fullPolicy)
     : THREAD_NAME(threadName)
     , MAX_QUEUE_SIZE(maxQueueSize)
+    , FULL_POLICY(fullPolicy)
     , m_exit(false)
 {
     InitializeCriticalSection(&m_cs);
@@ -95,20 +96,34 @@ void Thread::DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg)
 {
     if (m_exit.load() || m_hThread == NULL) return;
 
-    // If using XALLOCATOR explicit operator new required. See xallocator.h.
-    auto threadMsg = xmake_shared<ThreadMsg>(MSG_DISPATCH_DELEGATE, msg);
-
     EnterCriticalSection(&m_cs);
 
-    // [BACK PRESSURE LOGIC]
-    if (MAX_QUEUE_SIZE > 0)
+    // [BACK PRESSURE / DROP / FAULT LOGIC]
+    if (MAX_QUEUE_SIZE > 0 && m_queue.size() >= MAX_QUEUE_SIZE)
     {
-        // Wait while queue is full, BUT stop waiting if m_exit is true.
+        if (FULL_POLICY == FullPolicy::DROP)
+        {
+            LeaveCriticalSection(&m_cs);
+            return; // silently discard
+        }
+
+        if (FULL_POLICY == FullPolicy::FAULT)
+        {
+            LeaveCriticalSection(&m_cs);
+            printf("[Thread] CRITICAL: Queue full on thread '%s'! TRIGGERING FAULT.\n", THREAD_NAME.c_str());
+            ASSERT_TRUE(false);
+            return;
+        }
+
+        // BLOCK: wait while queue is full, BUT stop waiting if m_exit is true.
         while (m_queue.size() >= MAX_QUEUE_SIZE && !m_exit.load())
         {
             SleepConditionVariableCS(&m_cvNotFull, &m_cs, INFINITE);
         }
     }
+
+    // If using XALLOCATOR explicit operator new required. See xallocator.h.
+    auto threadMsg = xmake_shared<ThreadMsg>(MSG_DISPATCH_DELEGATE, msg);
 
     // If we woke up because of exit (or exit happened while waiting), abort
     if (!m_exit.load())
@@ -119,9 +134,12 @@ void Thread::DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg)
 
     LeaveCriticalSection(&m_cs);
 
-    LOG_INFO("Thread::DispatchDelegate\n   thread={}\n   target={}",
-        THREAD_NAME,
-        typeid(*threadMsg->GetData()->GetInvoker()).name());
+    if (threadMsg)
+    {
+        LOG_INFO("Thread::DispatchDelegate\n   thread={}\n   target={}",
+            THREAD_NAME,
+            typeid(*threadMsg->GetData()->GetInvoker()).name());
+    }
 }
 
 //----------------------------------------------------------------------------
@@ -273,6 +291,11 @@ size_t Thread::GetQueueSize()
     return size;
 }
 
+void Thread::Sleep(dmq::Duration timeout) {
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(timeout).count();
+    ::Sleep(static_cast<DWORD>(ms));
+}
+
 //----------------------------------------------------------------------------
 // WatchdogCheck
 //----------------------------------------------------------------------------
@@ -286,6 +309,7 @@ void Thread::WatchdogCheck()
     // Watchdog expired?
     if (delta > m_watchdogTimeout.load())
     {
+        printf("[Thread] Watchdog detected unresponsive thread: %s\n", THREAD_NAME.c_str());
         LOG_ERROR("Watchdog detected unresponsive thread: {}", THREAD_NAME);
 
         // @TODO Optionally trigger recovery, restart, or further actions here
@@ -298,4 +322,8 @@ void Thread::WatchdogCheck()
 //----------------------------------------------------------------------------
 void Thread::ThreadCheck()
 {
+    m_lastAliveTime.store(Timer::GetNow());
 }
+
+} // namespace dmq::os
+

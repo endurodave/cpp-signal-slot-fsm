@@ -37,6 +37,8 @@
 #include <cstdlib>
 #include <cerrno>
 
+namespace dmq::transport {
+
 class ZephyrUdpTransport : public ITransport
 {
 public:
@@ -129,6 +131,17 @@ public:
             zsock_shutdown(m_socket, ZSOCK_SHUT_RDWR);
             zsock_close(m_socket);
             m_socket = -1;
+        }
+    }
+
+    void SetRecvTimeout(std::chrono::milliseconds timeout)
+    {
+        if (m_socket >= 0)
+        {
+            struct timeval tv;
+            tv.tv_sec = timeout.count() / 1000;
+            tv.tv_usec = (timeout.count() % 1000) * 1000;
+            setsockopt(m_socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         }
     }
 
@@ -295,5 +308,7 @@ private:
     static const int BUFFER_SIZE = 1500; // Ethernet MTU size
     char m_buffer[BUFFER_SIZE] = { 0 };
 };
+
+}
 
 #endif // ZEPHYR_UDP_TRANSPORT_H

@@ -2,6 +2,7 @@
 #error "port/os/freertos/Thread.cpp requires DMQ_THREAD_FREERTOS. Remove this file from your build configuration or define DMQ_THREAD_FREERTOS."
 #endif
 
+#include "DelegateMQ.h"
 #include "Thread.h"
 #include "ThreadMsg.h"
 #include <cstdio>
@@ -10,13 +11,17 @@
 #define ASSERT_TRUE(x) configASSERT(x)
 #endif
 
+namespace dmq::os {
+
 using namespace dmq;
+using namespace dmq::util;
 
 //----------------------------------------------------------------------------
 // Thread Constructor
 //----------------------------------------------------------------------------
-Thread::Thread(const std::string& threadName, size_t maxQueueSize)
+Thread::Thread(const std::string& threadName, size_t maxQueueSize, FullPolicy fullPolicy)
     : THREAD_NAME(threadName)
+    , FULL_POLICY(fullPolicy)
     , m_exit(false)
 {
     m_queueSize = (maxQueueSize == 0) ? DEFAULT_QUEUE_SIZE : maxQueueSize;
@@ -49,7 +54,7 @@ void Thread::SetStackMem(StackType_t* stackBuffer, uint32_t stackSizeInWords)
 //----------------------------------------------------------------------------
 // CreateThread
 //----------------------------------------------------------------------------
-bool Thread::CreateThread()
+bool Thread::CreateThread(std::optional<dmq::Duration> watchdogTimeout)
 {
     if (IsThreadCreated())
         return true;
@@ -105,6 +110,36 @@ bool Thread::CreateThread()
     }
 
     ASSERT_TRUE(m_thread != nullptr);
+
+    {
+        std::lock_guard<dmq::RecursiveMutex> lock(m_watchdogMtx);
+        m_lastAliveTime = Timer::GetNow();
+    }
+
+    if (watchdogTimeout.has_value())
+    {
+        {
+            std::lock_guard<dmq::RecursiveMutex> lock(m_watchdogMtx);
+            m_watchdogTimeout = watchdogTimeout.value();
+        }
+
+        m_threadTimer = std::unique_ptr<Timer>(new Timer());
+        m_threadTimerConn = m_threadTimer->OnExpired.Connect(
+            MakeDelegate(this, &Thread::ThreadCheck, *this));
+        
+        dmq::Duration timeout;
+        {
+            std::lock_guard<dmq::RecursiveMutex> lock(m_watchdogMtx);
+            timeout = m_watchdogTimeout;
+        }
+        m_threadTimer->Start(timeout / 4);
+
+        m_watchdogTimer = std::unique_ptr<Timer>(new Timer());
+        m_watchdogTimerConn = m_watchdogTimer->OnExpired.Connect(
+            MakeDelegate(this, &Thread::WatchdogCheck));
+        m_watchdogTimer->Start(timeout / 2);
+    }
+
     return true;
 }
 
@@ -114,6 +149,17 @@ bool Thread::CreateThread()
 void Thread::ExitThread()
 {
     if (m_queue) {
+        if (m_watchdogTimer)
+        {
+            m_watchdogTimer->Stop();
+            m_watchdogTimerConn.Disconnect();
+        }
+        if (m_threadTimer)
+        {
+            m_threadTimer->Stop();
+            m_threadTimerConn.Disconnect();
+        }
+
         m_exit.store(true);
 
         ThreadMsg* msg = new (std::nothrow) ThreadMsg(MSG_EXIT_THREAD);
@@ -160,6 +206,11 @@ size_t Thread::GetQueueSize()
     return 0;
 }
 
+void Thread::Sleep(dmq::Duration timeout) {
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(timeout).count();
+    vTaskDelay(pdMS_TO_TICKS(ms));
+}
+
 void Thread::SetThreadPriority(int priority) {
     m_priority = priority;
     if (m_thread) {
@@ -189,11 +240,25 @@ void Thread::DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg)
         return;
     }
 
-    if (xQueueSend(m_queue, &threadMsg, pdMS_TO_TICKS(10)) != pdPASS) {
-        printf("[Thread] Error: Queue Full (%s)\n", THREAD_NAME.c_str());
-        delete threadMsg;
-    } else {
-        //printf("[Thread] Dispatch Success (%s)\n", THREAD_NAME.c_str());
+    // DROP: non-blocking — discard if queue is full, caller is never stalled.
+    // BLOCK: wait indefinitely — guarantees delivery, caller blocks until space is available.
+    // FAULT: non-blocking - trigger fault if queue full.
+    TickType_t timeout = (FULL_POLICY == FullPolicy::BLOCK) ? portMAX_DELAY : 0;
+
+    // Option #2: Implement High priority using xQueueSendToFront. 
+    // All other priorities use default FIFO (SendToBack).
+    BaseType_t status;
+    if (msg->GetPriority() == Priority::HIGH)
+        status = xQueueSendToFront(m_queue, &threadMsg, timeout);
+    else
+        status = xQueueSendToBack(m_queue, &threadMsg, timeout);
+
+    if (status != pdPASS) {
+        if (FULL_POLICY == FullPolicy::FAULT) {
+            printf("[Thread] CRITICAL: Queue full on thread '%s'! TRIGGERING FAULT.\n", THREAD_NAME.c_str());
+            ASSERT_TRUE(status == pdPASS);
+        }
+        delete threadMsg;  // queue full, message dropped per DROP/FAULT policy
     }
 }
 
@@ -208,11 +273,48 @@ void Thread::Process(void* instance)
     vTaskDelete(NULL);
 }
 
+//----------------------------------------------------------------------------
+// WatchdogCheck
+//----------------------------------------------------------------------------
+void Thread::WatchdogCheck()
+{
+    auto now = Timer::GetNow();
+    dmq::TimePoint lastAlive;
+    dmq::Duration watchdogTimeout;
+
+    {
+        std::lock_guard<dmq::RecursiveMutex> lock(m_watchdogMtx);
+        lastAlive = m_lastAliveTime;
+        watchdogTimeout = m_watchdogTimeout;
+    }
+
+    auto delta = now - lastAlive;
+    if (delta > watchdogTimeout)
+    {
+        printf("[Thread] Watchdog detected unresponsive thread: %s\n", THREAD_NAME.c_str());
+        // @TODO trigger recovery or fault handler
+    }
+}
+
+//----------------------------------------------------------------------------
+// ThreadCheck
+//----------------------------------------------------------------------------
+void Thread::ThreadCheck()
+{
+    std::lock_guard<dmq::RecursiveMutex> lock(m_watchdogMtx);
+    m_lastAliveTime = Timer::GetNow();
+}
+
 void Thread::Run()
 {
     ThreadMsg* msg = nullptr;
     while (!m_exit.load())
     {
+        {
+            std::lock_guard<dmq::RecursiveMutex> lock(m_watchdogMtx);
+            m_lastAliveTime = Timer::GetNow();
+        }
+
         if (xQueueReceive(m_queue, &msg, portMAX_DELAY) == pdPASS)
         {
             if (!msg) continue;
@@ -241,3 +343,6 @@ void Thread::Run()
         xSemaphoreGive(m_exitSem);
     }
 }
+
+} // namespace dmq::os
+

@@ -14,28 +14,47 @@
 ///
 /// @note This implementation is a basic port. For reference, the stdlib and win32
 /// implementations provide additional features:
-/// 1. Priority Support: Uses a priority queue to respect dmq::Priority.
-/// 2. Back Pressure: DispatchDelegate() blocks if the queue is full.
-/// 3. Watchdog: Includes a ThreadCheck() heartbeat mechanism.
-/// 4. Synchronized Startup: CreateThread() blocks until the worker thread is ready.
+/// 1. Synchronized Startup: CreateThread() blocks until the worker thread is ready.
 ///
 /// **Key Features:**
 /// * **Task Integration:** Wraps `tx_thread_create` to establish a dedicated worker loop.
-/// * **Queue-Based Dispatch:** Uses a `TX_QUEUE` to receive and process incoming 
+/// * **FullPolicy Support:** Configurable back-pressure (BLOCK or DROP) when the
+///   message queue is full.
+/// * **Priority Support:** Normal and High priorities (uses `tx_queue_front_send`).
+/// * **Queue-Based Dispatch:** Uses a `TX_QUEUE` to receive and process incoming
 ///   delegate messages in a thread-safe manner.
 /// * **Priority Control:** Supports runtime priority configuration via `SetThreadPriority`.
 /// * **Dynamic Configuration:** Allows configuring stack size and queue depth at construction.
-/// * **Graceful Shutdown:** Implements robust termination logic using semaphores to ensure 
+/// * **Graceful Shutdown:** Implements robust termination logic using semaphores to ensure
 ///   the thread exits cleanly before destruction.
+/// * **Watchdog Integration:** Optional heartbeat mechanism detects stalled or deadlocked
+///   threads. Enable by passing a timeout to CreateThread(). Requires
+///   Timer::ProcessTimers() to be called from a context that can preempt watched threads
+///   — typically a hardware timer ISR or the highest-priority task in the system.
 
 #include "delegate/IThread.h"
+#include "extras/util/Timer.h"
 #include "tx_api.h"
 #include <string>
 #include <memory>
 #include <vector>
 #include <atomic>
+#include <optional>
+
+namespace dmq::os {
 
 class ThreadMsg;
+
+/// @brief Policy applied when the thread message queue is full.
+/// @details Only meaningful when maxQueueSize > 0.
+///   - BLOCK: DispatchDelegate() blocks the caller until space is available (back pressure).
+///   - DROP:  DispatchDelegate() silently discards the message and returns immediately.
+///   - FAULT: DispatchDelegate() triggers a system fault if the queue is full.
+///
+/// Use DROP for high-rate best-effort topics (sensor telemetry, display updates) where
+/// a stale sample is preferable to stalling the publisher. Use BLOCK for critical topics
+/// (commands, state transitions) where no message may be lost. FAULT is the default.
+enum class FullPolicy { BLOCK, DROP, FAULT };
 
 class Thread : public dmq::IThread
 {
@@ -46,14 +65,17 @@ public:
     /// Constructor
     /// @param threadName Name for the ThreadX thread
     /// @param maxQueueSize Max number of messages in queue (0 = Default 20)
-    Thread(const std::string& threadName, size_t maxQueueSize = 0);
+    /// @param fullPolicy Action when queue is full: FAULT (default), BLOCK or DROP.
+    Thread(const std::string& threadName, size_t maxQueueSize = 0, FullPolicy fullPolicy = FullPolicy::FAULT);
 
     /// Destructor
     ~Thread();
 
-    /// Called once to create the worker thread
-    /// @return TRUE if thread is created. FALSE otherwise. 
-    bool CreateThread();
+    /// Called once to create the worker thread. If watchdogTimeout value
+    /// provided, the maximum watchdog interval is used. Otherwise no watchdog.
+    /// @param[in] watchdogTimeout - optional watchdog timeout.
+    /// @return TRUE if thread is created. FALSE otherwise.
+    bool CreateThread(std::optional<dmq::Duration> watchdogTimeout = std::nullopt);
 
     /// Terminate the thread gracefully
     void ExitThread();
@@ -80,6 +102,10 @@ public:
     /// Get current queue size
     size_t GetQueueSize();
 
+    /// Sleep for a duration.
+    /// @param[in] timeout - the duration to sleep.
+    static void Sleep(dmq::Duration timeout);
+
     // IThread Interface Implementation
     virtual void DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg) override;
 
@@ -93,8 +119,15 @@ private:
     // Run loop called by Process
     void Run();
 
+    /// Check watchdog is expired. Called from Timer::ProcessTimers() context.
+    void WatchdogCheck();
+
+    /// Timer expiration function dispatched to this thread to update m_lastAliveTime.
+    void ThreadCheck();
+
     const std::string THREAD_NAME;
-    size_t m_queueSize; // Stored queue size
+    const size_t m_queueSize; // Stored queue size
+    const FullPolicy FULL_POLICY;
     UINT m_priority;    // Stored priority
 
     // ThreadX Control Blocks
@@ -107,9 +140,19 @@ private:
     // Using ULONG[] ensures correct alignment for ThreadX stacks and queues
     std::unique_ptr<ULONG[]> m_stackMemory;
     std::unique_ptr<ULONG[]> m_queueMemory;
-    
+
     // Configurable stack size (bytes)
-    static const ULONG STACK_SIZE = 2048; 
+    static const ULONG STACK_SIZE = 2048;
+
+    // Watchdog related members
+    std::atomic<dmq::TimePoint> m_lastAliveTime;
+    std::unique_ptr<Timer> m_watchdogTimer;
+    dmq::ScopedConnection m_watchdogTimerConn;
+    std::unique_ptr<Timer> m_threadTimer;
+    dmq::ScopedConnection m_threadTimerConn;
+    std::atomic<dmq::Duration> m_watchdogTimeout;
 };
+
+} // namespace dmq::os
 
 #endif // _THREAD_THREADX_H

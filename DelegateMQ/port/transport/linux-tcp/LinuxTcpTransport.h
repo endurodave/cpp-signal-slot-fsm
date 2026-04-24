@@ -37,6 +37,8 @@
 #include "port/transport/DmqHeader.h"
 #include "port/transport/ITransportMonitor.h"
 
+namespace dmq::transport {
+
 class TcpTransport : public ITransport
 {
 public:
@@ -112,6 +114,17 @@ public:
 
         // Reset descriptors
         m_connFd = m_socket = -1;
+    }
+
+    void SetRecvTimeout(std::chrono::milliseconds timeout)
+    {
+        if (m_connFd >= 0)
+        {
+            struct timeval tv;
+            tv.tv_sec = timeout.count() / 1000;
+            tv.tv_usec = (timeout.count() % 1000) * 1000;
+            setsockopt(m_connFd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        }
     }
 
     virtual int Send(xostringstream& os, const DmqHeader& header) override
@@ -253,5 +266,7 @@ private:
     ITransport* m_sendTransport, * m_recvTransport;
     ITransportMonitor* m_transportMonitor = nullptr;
 };
+
+} // namespace dmq::transport
 
 #endif // LINUX_TCP_TRANSPORT_H

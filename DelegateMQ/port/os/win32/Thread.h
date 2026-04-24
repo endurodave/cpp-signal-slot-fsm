@@ -16,8 +16,9 @@
 /// **Key Features:**
 /// * **Priority Queue:** Uses `std::priority_queue` to ensure high-priority delegate
 ///   messages (e.g., system signals) are processed before lower-priority ones.
-/// * **Back Pressure:** Supports a configurable `maxQueueSize`. If the queue is full,
-///   `DispatchDelegate()` blocks the caller until space is available, preventing memory exhaustion.
+/// * **Queue Full Policy:** Configurable `FullPolicy` (BLOCK or DROP) when `maxQueueSize > 0`.
+///   BLOCK applies back pressure to the caller; DROP silently discards the message so the
+///   caller is never stalled. Default is BLOCK.
 /// * **Watchdog Integration:** Includes a built-in heartbeat mechanism. If the thread loop
 ///   stalls (deadlock or infinite loop), the watchdog timer detects the failure.
 /// * **Synchronized Start:** Uses a Win32 manual-reset event to ensure the thread
@@ -40,12 +41,25 @@
 #include <Windows.h>
 #endif
 
+namespace dmq::os {
+
 // Comparator for priority queue
 struct ThreadMsgComparator {
     bool operator()(const std::shared_ptr<ThreadMsg>& a, const std::shared_ptr<ThreadMsg>& b) const {
         return static_cast<int>(a->GetPriority()) < static_cast<int>(b->GetPriority());
     }
 };
+
+/// @brief Policy applied when the thread message queue is full.
+/// @details Only meaningful when maxQueueSize > 0.
+///   - BLOCK: DispatchDelegate() blocks the caller until space is available (back pressure).
+///   - DROP:  DispatchDelegate() silently discards the message and returns immediately.
+///   - FAULT: DispatchDelegate() triggers a system fault if the queue is full.
+///
+/// Use DROP for high-rate best-effort topics (sensor telemetry, display updates) where
+/// a stale sample is preferable to stalling the publisher. Use BLOCK for critical topics
+/// (commands, state transitions) where no message may be lost. FAULT is the default.
+enum class FullPolicy { BLOCK, DROP, FAULT };
 
 /// @brief Windows-native thread for systems using the Win32 API.
 /// @details The Thread class creates a worker thread capable of dispatching and
@@ -57,7 +71,9 @@ public:
     /// @param threadName The name of the thread for debugging.
     /// @param maxQueueSize The maximum number of messages allowed in the queue.
     ///                     0 means unlimited (no back pressure).
-    Thread(const std::string& threadName, size_t maxQueueSize = 0);
+    /// @param fullPolicy When the queue is full: FAULT (default), BLOCK or DROP.
+    ///                   Only meaningful when maxQueueSize > 0.
+    Thread(const std::string& threadName, size_t maxQueueSize = 0, FullPolicy fullPolicy = FullPolicy::FAULT);
 
     /// Destructor
     virtual ~Thread();
@@ -86,6 +102,10 @@ public:
     /// Get size of thread message queue.
     size_t GetQueueSize();
 
+    /// Sleep for a duration.
+    /// @param[in] timeout - the duration to sleep.
+    static void Sleep(dmq::Duration timeout);
+
     /// Dispatch and invoke a delegate target on the destination thread.
     /// @param[in] msg - Delegate message containing target function
     /// arguments.
@@ -102,8 +122,8 @@ private:
     void Process();
 
     /// Check watchdog is expired. This function is called by the thread
-    /// that calls Timer::ProcessTimers(). This function is thread-safe.
-    /// In a real-time OS, Timer::ProcessTimers() typically is called by the highest
+    /// that calls dmq::util::Timer::ProcessTimers(). This function is thread-safe.
+    /// In a real-time OS, dmq::util::Timer::ProcessTimers() typically is called by the highest
     /// priority task in the system.
     void WatchdogCheck();
 
@@ -136,15 +156,21 @@ private:
     // Max queue size for back pressure (0 = unlimited)
     const size_t MAX_QUEUE_SIZE;
 
+    // Policy applied when the thread message queue is full.
+    const FullPolicy FULL_POLICY;
+
     std::atomic<bool> m_exit;
 
     // Watchdog related members
     std::atomic<dmq::TimePoint> m_lastAliveTime;
-    std::unique_ptr<Timer> m_watchdogTimer;
+    std::unique_ptr<dmq::util::Timer> m_watchdogTimer;
     dmq::ScopedConnection m_watchdogTimerConn;
-    std::unique_ptr<Timer> m_threadTimer;
+    std::unique_ptr<dmq::util::Timer> m_threadTimer;
     dmq::ScopedConnection m_threadTimerConn;
     std::atomic<dmq::Duration> m_watchdogTimeout;
 };
+
+} // namespace dmq::os
+
 
 #endif

@@ -10,8 +10,10 @@
 #include <Windows.h>
 #endif
 
+namespace dmq::os {
+
 using namespace std;
-using namespace dmq;
+using namespace dmq::util;
 
 #define MSG_DISPATCH_DELEGATE	1
 #define MSG_EXIT_THREAD			2
@@ -19,11 +21,12 @@ using namespace dmq;
 //----------------------------------------------------------------------------
 // Thread
 //----------------------------------------------------------------------------
-Thread::Thread(const std::string& threadName, size_t maxQueueSize)
+Thread::Thread(const std::string& threadName, size_t maxQueueSize, FullPolicy fullPolicy)
     : m_thread(std::nullopt)
     , m_exit(false)
     , THREAD_NAME(threadName)
     , MAX_QUEUE_SIZE(maxQueueSize)
+    , FULL_POLICY(fullPolicy)
 {
 }
 
@@ -115,6 +118,10 @@ size_t Thread::GetQueueSize()
 {
     lock_guard<mutex> lock(m_mutex);
     return m_queue.size();
+}
+
+void Thread::Sleep(dmq::Duration timeout) {
+    std::this_thread::sleep_for(timeout);
 }
 
 //----------------------------------------------------------------------------
@@ -212,19 +219,29 @@ void Thread::DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg)
     if (!m_thread.has_value())
         throw std::invalid_argument("Thread pointer is null");
 
-    // If using XALLOCATOR explicit operator new required. See xallocator.h.
-    auto threadMsg = xmake_shared<ThreadMsg>(MSG_DISPATCH_DELEGATE, msg);
-
     std::unique_lock<std::mutex> lk(m_mutex);
 
-    // [BACK PRESSURE LOGIC]
-    if (MAX_QUEUE_SIZE > 0)
+    // [BACK PRESSURE / DROP / FAULT LOGIC]
+    if (MAX_QUEUE_SIZE > 0 && m_queue.size() >= MAX_QUEUE_SIZE)
     {
-        // Wait while queue is full, BUT stop waiting if m_exit is true.
+        if (FULL_POLICY == FullPolicy::DROP)
+            return;  // silently discard — caller is not stalled, no allocation wasted
+
+        if (FULL_POLICY == FullPolicy::FAULT)
+        {
+            printf("[Thread] CRITICAL: Queue full on thread '%s'! TRIGGERING FAULT.\n", THREAD_NAME.c_str());
+            ASSERT_TRUE(false);
+            return;
+        }
+
+        // BLOCK: wait until the consumer drains a slot or the thread exits
         m_cvNotFull.wait(lk, [this]() {
             return m_queue.size() < MAX_QUEUE_SIZE || m_exit.load();
             });
     }
+
+    // If using XALLOCATOR explicit operator new required. See xallocator.h.
+    auto threadMsg = xmake_shared<ThreadMsg>(MSG_DISPATCH_DELEGATE, msg);
 
     // If we woke up because of exit (or exit happened while waiting), abort
     if (m_exit.load())
@@ -251,6 +268,7 @@ void Thread::WatchdogCheck()
     // Watchdog expired?
     if (delta > m_watchdogTimeout.load())
     {
+        printf("[Thread] Watchdog detected unresponsive thread: %s\n", THREAD_NAME.c_str());
         LOG_ERROR("Watchdog detected unresponsive thread: {}", THREAD_NAME);
 
         // @TODO Optionally trigger recovery, restart, or further actions here
@@ -263,6 +281,7 @@ void Thread::WatchdogCheck()
 //----------------------------------------------------------------------------
 void Thread::ThreadCheck()
 {
+    m_lastAliveTime.store(Timer::GetNow());
 }
 
 //----------------------------------------------------------------------------
@@ -342,3 +361,6 @@ void Thread::Process()
         }
     }
 }
+
+} // namespace dmq::os
+

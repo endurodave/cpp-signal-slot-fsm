@@ -17,7 +17,7 @@ private:
     void Poll();
 
     // Timer used to generate periodic callbacks to the Poll() event.
-    Timer m_pollTimer;
+    dmq::util::Timer m_pollTimer;
 
     // RAII Connection handle for the timer.
     // Keeps the subscription active as long as this object exists or until Disconnect() is called.

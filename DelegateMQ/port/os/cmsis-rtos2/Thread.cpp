@@ -2,6 +2,7 @@
 #error "port/os/cmsis-rtos2/Thread.cpp requires DMQ_THREAD_CMSIS_RTOS2. Remove this file from your build configuration or define DMQ_THREAD_CMSIS_RTOS2."
 #endif
 
+#include "DelegateMQ.h"
 #include "Thread.h"
 #include "ThreadMsg.h"
 #include <cstdio>
@@ -12,18 +13,17 @@
 #define ASSERT_TRUE(x) if(!(x)) { while(1); }
 #endif
 
-using namespace dmq;
+namespace dmq::os {
 
 //----------------------------------------------------------------------------
 // Thread Constructor
 //----------------------------------------------------------------------------
-Thread::Thread(const std::string& threadName, size_t maxQueueSize) 
+Thread::Thread(const std::string& threadName, size_t maxQueueSize, FullPolicy fullPolicy) 
     : THREAD_NAME(threadName)
+    , m_queueSize((maxQueueSize == 0) ? DEFAULT_QUEUE_SIZE : maxQueueSize)
+    , FULL_POLICY(fullPolicy)
     , m_exit(false)
 {
-    // If 0 is passed, use the default size
-    m_queueSize = (maxQueueSize == 0) ? DEFAULT_QUEUE_SIZE : maxQueueSize;
-    
     // Default Priority
     m_priority = osPriorityNormal;
 }
@@ -44,7 +44,7 @@ Thread::~Thread()
 //----------------------------------------------------------------------------
 // CreateThread
 //----------------------------------------------------------------------------
-bool Thread::CreateThread()
+bool Thread::CreateThread(std::optional<dmq::Duration> watchdogTimeout)
 {
     if (m_thread == NULL)
     {
@@ -63,9 +63,26 @@ bool Thread::CreateThread()
         attr.name = THREAD_NAME.c_str();
         attr.stack_size = STACK_SIZE;
         attr.priority = m_priority;
-        
+
         m_thread = osThreadNew(Thread::Process, this, &attr);
         ASSERT_TRUE(m_thread != NULL);
+
+        m_lastAliveTime.store(dmq::util::Timer::GetNow());
+
+        if (watchdogTimeout.has_value())
+        {
+            m_watchdogTimeout = watchdogTimeout.value();
+
+            m_threadTimer = std::unique_ptr<dmq::util::Timer>(new dmq::util::Timer());
+            m_threadTimerConn = m_threadTimer->OnExpired.Connect(
+                dmq::MakeDelegate(this, &Thread::ThreadCheck, *this));
+            m_threadTimer->Start(m_watchdogTimeout.load() / 4);
+
+            m_watchdogTimer = std::unique_ptr<dmq::util::Timer>(new dmq::util::Timer());
+            m_watchdogTimerConn = m_watchdogTimer->OnExpired.Connect(
+                dmq::MakeDelegate(this, &Thread::WatchdogCheck));
+            m_watchdogTimer->Start(m_watchdogTimeout.load() / 2);
+        }
     }
     return true;
 }
@@ -96,8 +113,19 @@ osPriority_t Thread::GetThreadPriority()
 //----------------------------------------------------------------------------
 void Thread::ExitThread()
 {
-    if (m_msgq != NULL) 
+    if (m_msgq != NULL)
     {
+        if (m_watchdogTimer)
+        {
+            m_watchdogTimer->Stop();
+            m_watchdogTimerConn.Disconnect();
+        }
+        if (m_threadTimer)
+        {
+            m_threadTimer->Stop();
+            m_threadTimerConn.Disconnect();
+        }
+
         m_exit.store(true);
 
         // Send exit message
@@ -163,6 +191,11 @@ size_t Thread::GetQueueSize()
     return 0;
 }
 
+void Thread::Sleep(dmq::Duration timeout) {
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(timeout).count();
+    osDelay(static_cast<uint32_t>(ms));
+}
+
 //----------------------------------------------------------------------------
 // DispatchDelegate
 //----------------------------------------------------------------------------
@@ -174,12 +207,23 @@ void Thread::DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg)
     ThreadMsg* threadMsg = new (std::nothrow) ThreadMsg(MSG_DISPATCH_DELEGATE, msg);
     if (!threadMsg) return;
 
-    // 2. Send pointer to queue (Wait 10 ticks if full)
-    // Priority 0 (default)
-    if (osMessageQueuePut(m_msgq, &threadMsg, 0, 10) != osOK)
+    // 2. Send pointer to queue
+    // Set timeout based on FullPolicy: osWaitForever for BLOCK, 0 for DROP/FAULT.
+    uint32_t timeout = (FULL_POLICY == FullPolicy::BLOCK) ? osWaitForever : 0;
+
+    // Option #2: Implement High priority using msg_prio.
+    uint8_t msg_prio = (msg->GetPriority() == dmq::Priority::HIGH) ? 1 : 0;
+
+    osStatus_t ret = osMessageQueuePut(m_msgq, &threadMsg, msg_prio, timeout);
+    if (ret != osOK)
     {
+        if (FULL_POLICY == FullPolicy::FAULT)
+        {
+            printf("[Thread] CRITICAL: Queue full on thread '%s'! TRIGGERING FAULT.\n", THREAD_NAME.c_str());
+            ASSERT_TRUE(ret == osOK);
+        }
+        // Failed to send (queue full)
         delete threadMsg;
-        // Optional: printf("Error: Thread '%s' queue full!\n", THREAD_NAME.c_str());
     }
 }
 
@@ -193,7 +237,7 @@ void Thread::Process(void* argument)
     {
         thread->Run();
     }
-    
+
     // Thread terminates automatically when function returns.
     osThreadExit();
 }
@@ -201,12 +245,36 @@ void Thread::Process(void* argument)
 //----------------------------------------------------------------------------
 // Run (Member Function Loop)
 //----------------------------------------------------------------------------
+//----------------------------------------------------------------------------
+// WatchdogCheck
+//----------------------------------------------------------------------------
+void Thread::WatchdogCheck()
+{
+    auto now = dmq::util::Timer::GetNow();
+    auto lastAlive = m_lastAliveTime.load();
+    auto delta = now - lastAlive;
+    if (delta > m_watchdogTimeout.load())
+    {
+        // @TODO trigger recovery or fault handler
+    }
+}
+
+//----------------------------------------------------------------------------
+// ThreadCheck
+//----------------------------------------------------------------------------
+void Thread::ThreadCheck()
+{
+    m_lastAliveTime.store(dmq::util::Timer::GetNow());
+}
+
 void Thread::Run()
 {
     ThreadMsg* msg = nullptr;
-    
+
     while (!m_exit.load())
     {
+        m_lastAliveTime.store(dmq::util::Timer::GetNow());
+
         // Block forever waiting for a message
         // msg is a pointer to ThreadMsg*. The queue holds the pointer.
         if (osMessageQueueGet(m_msgq, &msg, NULL, osWaitForever) == osOK)
@@ -224,7 +292,7 @@ void Thread::Run()
                     }
                 }
             }
-            
+
             delete msg;
 
             if (msgId == MSG_EXIT_THREAD) {
@@ -238,3 +306,5 @@ void Thread::Run()
         osSemaphoreRelease(m_exitSem);
     }
 }
+
+} // namespace dmq::os
