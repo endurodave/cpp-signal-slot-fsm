@@ -53,7 +53,15 @@ public:
     // Publish data to a topic.
     template <typename T>
     static void Publish(const std::string& topic, const T& data) {
-        GetInstance().InternalPublish<T>(topic, data);
+        GetInstance().InternalPublish<T>(topic, data, false);
+    }
+
+    // Publish data to local subscribers only — does NOT forward to remote participants.
+    // Used by AddIncomingTopic to prevent relay loops when a topic is both incoming
+    // and outgoing on the same node.
+    template <typename T>
+    static void PublishLocal(const std::string& topic, const T& data) {
+        GetInstance().InternalPublish<T>(topic, data, true);
     }
 
     // Add a remote participant to the bus.
@@ -67,13 +75,29 @@ public:
         GetInstance().InternalRegisterSerializer<T>(topic, serializer);
     }
 
-    // Register an incoming remote topic and automatically republish received data to the local bus.
-    // Replaces the boilerplate RegisterHandler lambda pattern:
-    //   participant.RegisterHandler<T>(remoteId, serializer, [topic](T msg) {
-    //       DataBus::Publish<T>(topic, std::move(msg));
-    //   });
+    // Register an incoming remote topic and republish received data to the local bus only.
+    // Uses PublishLocal — the message reaches local subscribers, the spy, and the LVC, but is
+    // NOT re-forwarded to remote participants. This prevents relay loops when the same topic
+    // is registered as both incoming and outgoing on the same node.
+    //
+    // For bridge/relay nodes that must forward incoming data to other remote participants,
+    // use AddRelayTopic instead.
     template <typename T>
     static void AddIncomingTopic(const std::string& topic, dmq::DelegateRemoteId remoteId, Participant& participant, dmq::ISerializer<void(T)>& serializer) {
+        participant.RegisterHandler<T>(remoteId, serializer, [topic](const T& msg) {
+            DataBus::PublishLocal<T>(topic, msg);
+        });
+    }
+
+    // Register an incoming remote topic and re-publish received data to ALL local subscribers
+    // AND all registered remote participants (full Publish). Use this only on bridge/relay nodes
+    // where the explicit intent is to forward incoming data to other remote nodes.
+    //
+    // WARNING: Using AddRelayTopic on a node that also has the same topic as an outgoing
+    // (RegisterSerializer + AddParticipant) AND receives from a node that also relays will
+    // create an infinite relay loop. Use AddIncomingTopic instead for subscriber-only nodes.
+    template <typename T>
+    static void AddRelayTopic(const std::string& topic, dmq::DelegateRemoteId remoteId, Participant& participant, dmq::ISerializer<void(T)>& serializer) {
         participant.RegisterHandler<T>(remoteId, serializer, [topic](const T& msg) {
             DataBus::Publish<T>(topic, msg);
         });
@@ -99,8 +123,11 @@ public:
             ::FaultHandler(__FILE__, (unsigned short)__LINE__);
             return {};
         }
+
         DataBus& instance = GetInstance();
-        std::lock_guard<dmq::RecursiveMutex> lock(instance.m_mutex);
+
+        // Establish connection OUTSIDE the global DataBus lock to prevent 
+        // lock inversion deadlocks. Signal::Connect() is already thread-safe.
         if (thread) {
             auto del = dmq::MakeDelegate(std::move(func), *thread);
             del.SetPriority(priority);
@@ -150,11 +177,11 @@ private:
         // own independent last-delivery timestamp, so different subscribers on the same
         // topic can have different (or no) rate limits without affecting each other.
         if (qos.minSeparation.has_value()) {
-            auto minSepRep = qos.minSeparation.value().count();
-            auto lastDeliveryRep = std::make_shared<std::atomic<int64_t>>(0);
+            auto minSepRep = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(qos.minSeparation.value()).count());
+            auto lastDeliveryRep = std::make_shared<std::atomic<uint32_t>>(0);
             auto inner = std::move(typedFunc);
             typedFunc = [inner = std::move(inner), minSepRep, lastDeliveryRep](T data) {
-                auto nowRep = static_cast<int64_t>(dmq::Clock::now().time_since_epoch().count());
+                auto nowRep = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(dmq::Clock::now().time_since_epoch()).count());
                 auto lastRep = lastDeliveryRep->load(std::memory_order_relaxed);
                 if (nowRep - lastRep >= minSepRep) {
                     lastDeliveryRep->store(nowRep, std::memory_order_relaxed);
@@ -177,18 +204,25 @@ private:
 
             // 2. Get or create signal with type safety check (std::type_index)
             signal = GetOrCreateSignal<T>(topic);
-            if (!signal) {
-                return {}; // Type mismatch or other failure
-            }
+        }
 
-            // 3. Establish connection while holding the lock. This ensures no publishes
-            // are missed, as any new publish will be blocked until this lock is released.
-            if (thread) {
-                conn = signal->Connect(dmq::MakeDelegate(typedFunc, *thread));
-            } else {
-                conn = signal->Connect(dmq::MakeDelegate(typedFunc));
-            }
+        if (!signal) {
+            return {}; // Type mismatch or other failure
+        }
 
+        // 3. Establish connection OUTSIDE the lock to prevent deadlock with Timer/Signal locks.
+        // NOTE: There is a theoretical race where a publish happens between releasing the 
+        // DataBus lock and acquiring the Signal lock. However, both use RecursiveMutex 
+        // and InternalPublish also snapshots signals outside its lock, so this is 
+        // architecturally consistent with the "lock-free dispatch" pattern used elsewhere.
+        if (thread) {
+            conn = signal->Connect(dmq::MakeDelegate(typedFunc, *thread));
+        } else {
+            conn = signal->Connect(dmq::MakeDelegate(typedFunc));
+        }
+
+        {
+            std::lock_guard<dmq::RecursiveMutex> lock(m_mutex);
             // 4. Prepare LVC delivery if enabled and available
             if (qos.lastValueCache) {
                 auto it = m_lastValues.find(topic);
@@ -225,7 +259,7 @@ private:
     }
 
     template <typename T>
-    void InternalPublish(const std::string& topic, const T& data) {
+    void InternalPublish(const std::string& topic, const T& data, bool localOnly) {
         // Capture timestamp before lock acquisition for maximum accuracy and 
         // monotonic ordering using dmq::Clock.
         auto now = dmq::Clock::now();
@@ -298,7 +332,7 @@ private:
         }
 
         // 8. Remote distribution using the snapshot
-        if (serializer) {
+        if (!localOnly && serializer) {
             for (auto& participant : participantsSnapshot) {
                 participant->Send<T>(topic, data, *serializer);
                 handled = true;
@@ -413,4 +447,3 @@ private:
 
 
 #endif // DMQ_DATABUS_H
-

@@ -19,7 +19,7 @@
 /// **Key Features:**
 /// * **Task Integration:** Wraps a FreeRTOS `xTaskCreate` call to establish a
 ///   dedicated worker loop.
-/// * **FullPolicy Support:** Configurable back-pressure (BLOCK or DROP) when the
+/// * **FullPolicy Support:** Configurable back-pressure (DROP or TIMEOUT) when the
 ///   message queue is full.
 /// * **Priority Support:** Normal and High priorities (uses `xQueueSendToFront`).
 /// * **Queue-Based Dispatch:** Uses a FreeRTOS `QueueHandle_t` to receive and
@@ -50,26 +50,47 @@ class ThreadMsg;
 
 /// @brief Policy applied when the FreeRTOS task queue is full.
 /// @details Controls the behavior of DispatchDelegate() when the queue has no space.
-///   - DROP:  xQueueSend() with timeout 0 — returns immediately, message discarded.
-///   - BLOCK: xQueueSend() with portMAX_DELAY — caller blocks until space is available.
-///   - FAULT: xQueueSend() with timeout 0 - returns immediately, triggers a system fault if queue full.
+///   - DROP:    xQueueSend() with timeout 0 — returns immediately, message discarded.
+///   - FAULT:   xQueueSend() with timeout 0 — returns immediately, triggers a system fault if queue full.
+///   - TIMEOUT: xQueueSend() with a finite timeout — logs and drops if space is not available in time.
 ///
-/// FAULT is the default. For embedded targets where the
-/// caller may be an ISR or high-priority task, consider using DROP to avoid
-/// priority inversion or blocking at an unsafe context.
-enum class FullPolicy { BLOCK, DROP, FAULT };
+/// FAULT is the default. For embedded targets where the caller may be an ISR or
+/// high-priority task, consider DROP to avoid blocking at an unsafe context.
+enum class FullPolicy { DROP, FAULT, TIMEOUT };
 
 class Thread : public dmq::IThread
 {
 public:
+#if defined(DMQ_DATABUS_TOOLS)
+    /// @brief Statistics captured for thread monitoring.
+    struct ThreadStats {
+        std::string cpu_name;
+        std::string thread_name;
+        size_t queue_depth;           // Current depth
+        size_t queue_depth_max_window;// Max depth since last snapshot
+        size_t queue_depth_max_all;   // All-time max depth
+        size_t queue_size_limit;      // Max allowed
+        float latency_avg_ms;        // Avg wait in window
+        float latency_max_window_ms; // Max wait since last snapshot
+        float latency_max_all_ms;    // All-time max wait
+        float invoke_avg_ms;         // Avg execution in window
+        float invoke_max_window_ms;  // Max execution since last snapshot
+        float invoke_max_all_ms;     // All-time max execution
+        uint64_t dispatch_count;      // Total dispatches (all-time)
+    };
+#endif
+
     /// Default queue size if 0 is passed
-    static const size_t DEFAULT_QUEUE_SIZE = 20;
+    static const size_t DEFAULT_QUEUE_SIZE = dmq::DEFAULT_QUEUE_SIZE;
 
     /// Constructor
     /// @param threadName Name for the FreeRTOS task
-    /// @param maxQueueSize Max number of messages in queue (0 = Default 20)
-    /// @param fullPolicy Action when queue is full: FAULT (default), BLOCK or DROP.
-    Thread(const std::string& threadName, size_t maxQueueSize = 0, FullPolicy fullPolicy = FullPolicy::FAULT);
+    /// @param maxQueueSize Max number of messages in queue (0 = Default dmq::DEFAULT_QUEUE_SIZE)
+    /// @param fullPolicy Action when queue is full: FAULT (default), DROP, or TIMEOUT.
+    /// @param dispatchTimeout Duration to wait before giving up when policy is TIMEOUT.
+    /// @param cpuName Optional CPU/Core name grouping for monitoring tools.
+    Thread(const std::string& threadName, size_t maxQueueSize = 0, FullPolicy fullPolicy = FullPolicy::FAULT,
+           dmq::Duration dispatchTimeout = dmq::DEFAULT_DISPATCH_TIMEOUT, const std::string& cpuName = "");
 
     /// Destructor
     ~Thread();
@@ -116,12 +137,22 @@ public:
     void SetStackMem(StackType_t* stackBuffer, uint32_t stackSizeInWords);
 
     // IThread Interface Implementation
-    virtual void DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg) override;
+    virtual bool DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg) override;
 
-    /// Update the last alive time for the watchdog. 
-    /// @details Normally called automatically by internal timers. For threads with 
-    /// blocking loops (e.g. Network receiver), call this manually to prevent timeouts.
+    /// @brief Manually update the watchdog alive timestamp.
+    /// @details The Run() loop refreshes the timestamp automatically on every iteration.
+    /// Call this from inside long-running message handlers to prevent a false watchdog
+    /// alarm when a handler legitimately takes longer than watchdogTimeout.
     void ThreadCheck();
+
+    /// @brief Check all registered threads for watchdog expiration.
+    /// @details Call this from the highest-priority task in the system.
+    static void WatchdogCheckAll();
+
+#if defined(DMQ_DATABUS_TOOLS)
+    /// @brief Capture and reset windowed statistics.
+    ThreadStats SnapshotStats();
+#endif
 
 private:
     Thread(const Thread&) = delete;
@@ -133,11 +164,27 @@ private:
     // Run loop called by Process
     void Run();
 
-    /// Check watchdog is expired. Called from Timer::ProcessTimers() context.
+    /// Check watchdog is expired for this instance. 
     void WatchdogCheck();
 
+    /// Get registry head using the "Immortal" Pattern
+    static Thread*& GetWatchdogHead()
+    {
+        static Thread* head = nullptr;
+        return head;
+    }
+
+    /// Get registry lock using the "Immortal" Pattern
+    static dmq::RecursiveMutex& GetWatchdogLock()
+    {
+        static dmq::RecursiveMutex* lock = new dmq::RecursiveMutex();
+        return *lock;
+    }
+
     const std::string THREAD_NAME;
+    const std::string CPU_NAME;
     const FullPolicy FULL_POLICY;
+    const dmq::Duration m_dispatchTimeout;
     size_t m_queueSize;
     int m_priority;
 
@@ -148,17 +195,33 @@ private:
 
     // Static allocation support
     StackType_t* m_stackBuffer = nullptr;
-    uint32_t m_stackSize = 1024; // Default size (words)
+    uint32_t m_stackSize = 4096; // Default size (words)
     StaticTask_t m_tcb;          // TCB storage for static creation
 
     // Watchdog related members
-    dmq::TimePoint m_lastAliveTime;
-    std::unique_ptr<dmq::util::Timer> m_watchdogTimer;
-    dmq::ScopedConnection m_watchdogTimerConn;
-    std::unique_ptr<dmq::util::Timer> m_threadTimer;
-    dmq::ScopedConnection m_threadTimerConn;
-    dmq::Duration m_watchdogTimeout;
-    dmq::RecursiveMutex m_watchdogMtx;
+    std::atomic<uint32_t> m_lastAliveTime{0};
+    std::atomic<uint32_t> m_watchdogTimeout{0};
+    Thread* m_watchdogNext = nullptr;
+
+#if defined(DMQ_DATABUS_TOOLS)
+    // Monitoring statistics members
+    std::atomic<size_t> m_queueDepthMaxWindow{0};
+    std::atomic<size_t> m_queueDepthMaxAll{0};
+
+    // Use a mutex to protect 64-bit stats on 32-bit platforms without libatomic
+    dmq::RecursiveMutex m_statsLock;
+    int64_t m_latencyTotalWindow{0};
+    uint32_t m_latencyCountWindow{0};
+    int64_t m_latencyMaxWindow{0};
+    int64_t m_latencyMaxAll{0};
+
+    int64_t m_invokeTotalWindow{0};
+    uint32_t m_invokeCountWindow{0};
+    int64_t m_invokeMaxWindow{0};
+    int64_t m_invokeMaxAll{0};
+
+    uint64_t m_dispatchCountAll{0};
+#endif
 };
 
 } // namespace dmq::os
