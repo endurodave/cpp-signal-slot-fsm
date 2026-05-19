@@ -4,6 +4,13 @@
 /// @file
 /// @brief Delegate library options header file.
 
+// Pull in user config if provided, otherwise use library defaults.
+// To provide your own config: -DDMQ_USER_CONFIG="path/to/DelegateMQConfig.h"
+#ifdef DMQ_USER_CONFIG
+    #include DMQ_USER_CONFIG
+#endif
+#include "DelegateMQConfig_Default.h"
+
 #if defined(_WIN32) || defined(_WIN64)
     #ifndef WIN32_LEAN_AND_MEAN
         #define WIN32_LEAN_AND_MEAN
@@ -59,7 +66,9 @@
 #endif
 
 #include <chrono>
-#if defined(DMQ_THREAD_STDLIB) || defined(DMQ_THREAD_WIN32) || defined(DMQ_THREAD_QT)
+#if defined(DMQ_THREAD_STDLIB) || defined(DMQ_THREAD_WIN32) || defined(DMQ_THREAD_QT) || \
+    defined(DMQ_THREAD_FREERTOS) || defined(DMQ_THREAD_THREADX) || \
+    defined(DMQ_THREAD_ZEPHYR) || defined(DMQ_THREAD_CMSIS_RTOS2)
     #include <mutex>
 #endif
 
@@ -72,12 +81,10 @@
     // Windows / Linux / macOS / Qt (Standard Library)
     #include <condition_variable>
 #elif defined(DMQ_THREAD_FREERTOS)
-    #include <mutex>
     #include "port/os/freertos/FreeRTOSClock.h"
     #include "port/os/freertos/FreeRTOSMutex.h"
     #include "port/os/freertos/FreeRTOSConditionVariable.h"
 #elif defined(DMQ_THREAD_THREADX)
-    #include <mutex>
     #include "port/os/threadx/ThreadXClock.h"
     #include "port/os/threadx/ThreadXMutex.h"
     #include "port/os/threadx/ThreadXConditionVariable.h"
@@ -106,6 +113,28 @@ namespace dmq
         PortableLockGuard(const PortableLockGuard&) = delete;
         PortableLockGuard& operator=(const PortableLockGuard&) = delete;
     };
+
+    // --- PORTABLE SCOPED LOCK ---
+    // Maps to std::scoped_lock on all known threaded ports (desktop + RTOS).
+    // All RTOS mutex types satisfy BasicLockable (lock/unlock), so std::scoped_lock
+    // works with them directly. Falls back to a no-op for DMQ_THREAD_NONE and for
+    // any unrecognized bare-metal build where no thread model is defined.
+#if defined(DMQ_THREAD_STDLIB) || defined(DMQ_THREAD_WIN32) || defined(DMQ_THREAD_QT) || \
+    defined(DMQ_THREAD_FREERTOS) || defined(DMQ_THREAD_THREADX) || \
+    defined(DMQ_THREAD_ZEPHYR) || defined(DMQ_THREAD_CMSIS_RTOS2)
+    template <typename... M>
+    using ScopedLock = std::scoped_lock<M...>;
+#else
+    // No-op: DMQ_THREAD_NONE or no thread model defined (bare-metal, single-threaded)
+    template <typename... M>
+    class ScopedLock {
+    public:
+        explicit ScopedLock(M&...) noexcept {}
+        ~ScopedLock() noexcept = default;
+        ScopedLock(const ScopedLock&) = delete;
+        ScopedLock& operator=(const ScopedLock&) = delete;
+    };
+#endif
 
     // @TODO: Change aliases to switch clock type globally if necessary
 
@@ -140,23 +169,31 @@ namespace dmq
     using TimePoint = typename Clock::time_point;
 
     /// @brief Default timeout for the TIMEOUT queue-full policy across all Thread ports.
-    /// Override per-thread at construction or project-wide before including this header.
-    inline constexpr std::chrono::seconds DEFAULT_DISPATCH_TIMEOUT{2};
+    /// Override via DMQ_DEFAULT_DISPATCH_TIMEOUT in DelegateMQConfig.h.
+    inline constexpr std::chrono::seconds DEFAULT_DISPATCH_TIMEOUT{DMQ_DEFAULT_DISPATCH_TIMEOUT};
 
     // --- RESOURCE LIMITS & SBO CONFIGURATION ---
-    
-    /// @brief Max timers processed in one tick without heap allocation.
-    inline constexpr size_t MAX_TIMER_EXPIRED = 16;
 
-    /// @brief Signal Small-Buffer Optimization (SBO) count. 
+    /// @brief Max timers processed in one tick without heap allocation.
+    /// Override via DMQ_MAX_TIMER_EXPIRED in delegatemqconfig.h.
+    inline constexpr size_t MAX_TIMER_EXPIRED = DMQ_MAX_TIMER_EXPIRED;
+
+    /// @brief Signal Small-Buffer Optimization (SBO) count.
     /// Signals with <= this many subscribers are invoked heap-free.
-    inline constexpr size_t SIGNAL_SBO_COUNT = 8;
+    /// Override via DMQ_SIGNAL_SBO_COUNT in delegatemqconfig.h.
+    inline constexpr size_t SIGNAL_SBO_COUNT = DMQ_SIGNAL_SBO_COUNT;
 
     /// @brief Default internal queue size for all dmq::os::Thread ports.
-    inline constexpr size_t DEFAULT_QUEUE_SIZE = 20;
+    /// Override via DMQ_DEFAULT_QUEUE_SIZE in delegatemqconfig.h.
+    inline constexpr size_t DEFAULT_QUEUE_SIZE = DMQ_DEFAULT_QUEUE_SIZE;
 
     /// @brief Max number of threads that can be monitored by the watchdog.
-    inline constexpr size_t MAX_WATCHDOG_THREADS = 16;
+    /// Override via DMQ_MAX_WATCHDOG_THREADS in delegatemqconfig.h.
+    inline constexpr size_t MAX_WATCHDOG_THREADS = DMQ_MAX_WATCHDOG_THREADS;
+
+    /// @brief Max number of remote Participants the DataBus can hold without heap allocation.
+    /// Override via DMQ_MAX_PARTICIPANTS in delegatemqconfig.h.
+    inline constexpr size_t MAX_PARTICIPANTS = DMQ_MAX_PARTICIPANTS;
 
     // --- MUTEX / LOCK SELECTION ---
 #if defined(DMQ_THREAD_STDLIB) || defined(DMQ_THREAD_WIN32) || defined(DMQ_THREAD_QT)
@@ -241,6 +278,7 @@ namespace dmq
     // Use stl_allocator fixed-block allocator for dynamic storage allocation
     #include "extras/allocator/xstring.h"
     #include "extras/allocator/xlist.h"
+    #include "extras/allocator/xmap.h"
     #include "extras/allocator/xsstream.h"
     #include "extras/allocator/stl_allocator.h"
     #include "extras/allocator/xnew.h"
@@ -248,6 +286,7 @@ namespace dmq
 #else
     #include <string>
     #include <list>
+    #include <map>
     #include <sstream>
     #include <memory>
     #include <utility>
@@ -288,6 +327,13 @@ namespace dmq
             delete p;
         }
     }
+
+    // Fallback xmap/xmultimap — use std::map when fixed-block allocator is disabled
+    template <typename Key, typename Value, typename Alloc = std::allocator<std::pair<const Key, Value>>>
+    using xmap = std::map<Key, Value, std::less<Key>, Alloc>;
+
+    template <typename Key, typename Value, typename Alloc = std::allocator<std::pair<const Key, Value>>>
+    using xmultimap = std::multimap<Key, Value, std::less<Key>, Alloc>;
 #endif
 
 // @TODO: Select the desired logging (see Port.cmake).
