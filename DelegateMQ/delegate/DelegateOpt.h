@@ -195,6 +195,10 @@ namespace dmq
     /// Override via DMQ_MAX_PARTICIPANTS in delegatemqconfig.h.
     inline constexpr size_t MAX_PARTICIPANTS = DMQ_MAX_PARTICIPANTS;
 
+    /// @brief Max number of pending messages the TransportMonitor can track.
+    /// Override via DMQ_TRANSPORT_MONITOR_MAX_PENDING in delegatemqconfig.h.
+    inline constexpr size_t MAX_TRANSPORT_MONITOR_PENDING = DMQ_TRANSPORT_MONITOR_MAX_PENDING;
+
     // --- MUTEX / LOCK SELECTION ---
 #if defined(DMQ_THREAD_STDLIB) || defined(DMQ_THREAD_WIN32) || defined(DMQ_THREAD_QT)
     // Windows / Linux / macOS / Qt
@@ -258,10 +262,9 @@ namespace dmq
 // @TODO: Select the desired software fault handling (see Port.cmake).
 #ifdef DMQ_ASSERTS
     #include "extras/util/Fault.h"
-    #include <cassert>
     // Use assert error handling. Change assert to a different error 
     // handler as required by the target application.
-    #define BAD_ALLOC() assert(false && "Memory allocation failed!")
+    #define BAD_ALLOC() ASSERT()
 #else
     #include "extras/util/Fault.h"
     #include <new>
