@@ -1,5 +1,17 @@
-#ifndef _FAULT__H
-#define _FAULT__H
+#ifndef _FAULT_H_
+#define _FAULT_H_
+
+#ifdef __cplusplus
+    #define DMQ_NORETURN [[noreturn]]
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+    #define DMQ_NORETURN _Noreturn
+#elif defined(__GNUC__) || defined(__clang__)
+    #define DMQ_NORETURN __attribute__((noreturn))
+#elif defined(_MSC_VER)
+    #define DMQ_NORETURN __declspec(noreturn)
+#else
+    #define DMQ_NORETURN
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -24,7 +36,7 @@ extern "C" {
 	/// Handles all software assertions in the system.
 	/// @param[in] file - the file name that the software assertion occurred on
 	/// @param[in] line - the line number that the software assertion occurred on
-	void FaultHandler(const char* file, unsigned short line);
+	DMQ_NORETURN void FaultHandler(const char* file, unsigned short line);
 
 #ifdef __cplusplus
 }
