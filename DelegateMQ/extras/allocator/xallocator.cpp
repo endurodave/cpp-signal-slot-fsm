@@ -50,16 +50,16 @@ struct BlockHeader {
 	#define MAX_BLOCKS		32
 
 	// Create static storage for each static allocator instance
-	static char _allocator8 [sizeof(AllocatorPool<char[8], MAX_BLOCKS>)];
-	static char _allocator16 [sizeof(AllocatorPool<char[16], MAX_BLOCKS>)];
-	static char _allocator32 [sizeof(AllocatorPool<char[32], MAX_BLOCKS>)];
-	static char _allocator64 [sizeof(AllocatorPool<char[64], MAX_BLOCKS>)];
-	static char _allocator128 [sizeof(AllocatorPool<char[128], MAX_BLOCKS>)];
-	static char _allocator256 [sizeof(AllocatorPool<char[256], MAX_BLOCKS>)];
-	static char _allocator512 [sizeof(AllocatorPool<char[512], MAX_BLOCKS>)];
-	static char _allocator1024 [sizeof(AllocatorPool<char[1024], MAX_BLOCKS>)];
-	static char _allocator2048 [sizeof(AllocatorPool<char[2048], MAX_BLOCKS>)];	
-	static char _allocator4096 [sizeof(AllocatorPool<char[4096], MAX_BLOCKS>)];
+	static alignas(std::max_align_t) char _allocator8 [sizeof(AllocatorPool<char[8], MAX_BLOCKS>)];
+	static alignas(std::max_align_t) char _allocator16 [sizeof(AllocatorPool<char[16], MAX_BLOCKS>)];
+	static alignas(std::max_align_t) char _allocator32 [sizeof(AllocatorPool<char[32], MAX_BLOCKS>)];
+	static alignas(std::max_align_t) char _allocator64 [sizeof(AllocatorPool<char[64], MAX_BLOCKS>)];
+	static alignas(std::max_align_t) char _allocator128 [sizeof(AllocatorPool<char[128], MAX_BLOCKS>)];
+	static alignas(std::max_align_t) char _allocator256 [sizeof(AllocatorPool<char[256], MAX_BLOCKS>)];
+	static alignas(std::max_align_t) char _allocator512 [sizeof(AllocatorPool<char[512], MAX_BLOCKS>)];
+	static alignas(std::max_align_t) char _allocator1024 [sizeof(AllocatorPool<char[1024], MAX_BLOCKS>)];
+	static alignas(std::max_align_t) char _allocator2048 [sizeof(AllocatorPool<char[2048], MAX_BLOCKS>)];	
+	static alignas(std::max_align_t) char _allocator4096 [sizeof(AllocatorPool<char[4096], MAX_BLOCKS>)];
 
 	// Array of pointers to all allocator instances
 	static Allocator* _allocators[MAX_ALLOCATORS];
@@ -83,7 +83,7 @@ struct BlockHeader {
 // and xalloc_destroy() before main exits. In all other situations
 // XallocInitDestroy must be used to call xalloc_init() and xalloc_destroy().
 #ifdef AUTOMATIC_XALLOCATOR_INIT_DESTROY
-int32_t XallocInitDestroy::refCount = 0;
+std::atomic<int32_t> XallocInitDestroy::refCount(0);
 XallocInitDestroy::XallocInitDestroy() 
 { 
 	// Track how many static instances of XallocInitDestroy are created
@@ -114,8 +114,13 @@ T nexthigher(T k)
 
 static dmq::Mutex& get_mutex()
 {
-	static dmq::Mutex _mutex;
-	return _mutex;
+	// Intentional immortal singleton: heap-allocate and never delete.
+	// A Meyers static would be destroyed during the static shutdown sequence;
+	// any static destructor that runs afterward and calls xalloc_* would then
+	// use-after-free the mutex. The heap pointer is never freed — the OS
+	// reclaims it at process exit, after all destructors have run.
+	static dmq::Mutex* _mutex = new dmq::Mutex();
+	return *_mutex;
 }
 
 #ifdef CHECK_ALIGNMENT

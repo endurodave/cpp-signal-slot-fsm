@@ -43,6 +43,8 @@ void ThreadMonitor::Enable(const dmq::xstring& topic) {
     if (instance.m_enabled.exchange(true)) return;
 
     instance.m_topic = topic;
+
+    dmq::LockGuard<dmq::Mutex> lock(instance.m_mutex);
     instance.m_monitorThread.emplace("ThreadMonitor", 10);
     instance.m_monitorThread->CreateThread();
     
@@ -53,10 +55,15 @@ void ThreadMonitor::Disable() {
     auto& instance = GetInstance();
     if (!instance.m_enabled.exchange(false)) return;
 
+    // ExitThread() must not be called while holding m_mutex: MonitorLoop
+    // acquires m_mutex after Sleep() to check m_enabled before re-arming,
+    // which would deadlock if Disable() held the lock across the join.
     if (instance.m_monitorThread) {
         instance.m_monitorThread->ExitThread();
-        instance.m_monitorThread.reset();
     }
+
+    dmq::LockGuard<dmq::Mutex> lock(instance.m_mutex);
+    instance.m_monitorThread.reset();
 }
 
 void ThreadMonitor::MonitorLoop() {
@@ -98,6 +105,8 @@ void ThreadMonitor::MonitorLoop() {
 
     if (m_enabled) {
         dmq::os::Thread::Sleep(std::chrono::seconds(2));
+        
+        dmq::LockGuard<dmq::Mutex> lock(m_mutex);
         if (m_enabled && m_monitorThread.has_value())
             (void)dmq::MakeDelegate(this, &ThreadMonitor::MonitorLoop, *m_monitorThread).AsyncInvoke();
     }

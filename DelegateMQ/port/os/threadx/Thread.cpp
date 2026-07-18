@@ -224,6 +224,11 @@ void Thread::ExitThread()
         tx_thread_terminate(&m_thread);
         tx_thread_delete(&m_thread);
 
+        ThreadMsg* drainMsg = nullptr;
+        while (tx_queue_receive(&m_queue, &drainMsg, TX_NO_WAIT) == TX_SUCCESS) {
+            delete drainMsg;
+        }
+
         // Delete queue
         tx_queue_delete(&m_queue);
 
@@ -553,7 +558,7 @@ Thread::ThreadStats Thread::SnapshotStats()
     stats.dispatch_count = m_dispatchCountAll;
 
     // Reset windowed stats
-    m_queueDepthMaxWindow = stats.queue_depth;
+    m_queueDepthMaxWindow = 0;
     m_latencyTotalWindow = Duration(0);
     m_latencyCountWindow = 0;
     m_latencyMaxWindow = Duration(0);

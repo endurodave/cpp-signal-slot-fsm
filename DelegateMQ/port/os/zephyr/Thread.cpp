@@ -163,6 +163,11 @@ void Thread::ExitThread()
             k_sem_take(&m_exitSem, K_FOREVER);
         }
 
+        ThreadMsg* drainMsg = nullptr;
+        while (k_msgq_get(&m_msgq, &drainMsg, K_NO_WAIT) == 0) {
+            delete drainMsg;
+        }
+
         // Reset buffers to mark as exited. This prevents a double-entry deadlock:
         // ~Thread() calls ExitThread() unconditionally, so if ExitThread() was already
         // called explicitly, the second call must be a no-op (m_stackMemory is null).
@@ -490,7 +495,7 @@ Thread::ThreadStats Thread::SnapshotStats()
     stats.dispatch_count = m_dispatchCountAll;
 
     // Reset windowed stats
-    m_queueDepthMaxWindow = stats.queue_depth;
+    m_queueDepthMaxWindow = 0;
     m_latencyTotalWindow = Duration(0);
     m_latencyCountWindow = 0;
     m_latencyMaxWindow = Duration(0);

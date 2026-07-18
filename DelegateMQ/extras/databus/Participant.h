@@ -11,7 +11,6 @@
 #include <algorithm>
 #include <string>
 #include <memory>
-#include <mutex>
 #include <typeindex>
 
 namespace dmq::databus {
@@ -41,9 +40,16 @@ public:
     // Add a remote topic mapping.
     // When local DataBus publishes to 'topic', it will be sent to this participant using 'remoteId'.
     void AddRemoteTopic(const dmq::xstring& topic, dmq::DelegateRemoteId remoteId) {
-        std::lock_guard<dmq::RecursiveMutex> lock(m_mutex);
+        dmq::LockGuard<dmq::RecursiveMutex> lock(m_mutex);
         m_topicToRemoteId[topic] = remoteId;
     }
+
+    // Enable or disable continuous error mode (disables error latching).
+private:
+    void EnableContinuousErrors(bool enable) {
+        m_continuousErrors = enable;
+    }
+public:
 
     // Subscribe to technical errors (serialization/dispatch) for this participant.
     [[nodiscard]] dmq::ScopedConnection SubscribeError(std::function<void(const dmq::xstring&, dmq::DelegateError)> func) {
@@ -51,16 +57,19 @@ public:
     }
 
     // Process incoming data from the transport.
+    // Must not be called concurrently — m_receiveMutex serializes the transport read.
     // @return The result code from ITransport::Receive.
     int ProcessIncoming() {
-        // Clear the stream for reuse to avoid heap growth
-        m_inputStream.str("");
-        m_inputStream.clear();
-
         dmq::transport::DmqHeader header;
-        dmq::IRemoteInvoker* invoker = nullptr;
+        dmq::xstringstream inputStream(std::ios::in | std::ios::out | std::ios::binary);
 
-        int result = m_transport->Receive(m_inputStream, header);
+        int result;
+        {
+            // Serialize access to the transport read
+            dmq::LockGuard<dmq::Mutex> receiveLock(m_receiveMutex);
+            result = m_transport->Receive(inputStream, header);
+        }
+
         if (result == 0) {
             // Validate header marker
             if (header.GetMarker() != dmq::transport::DmqHeader::MARKER) {
@@ -72,15 +81,16 @@ public:
 
             // Filter out duplicate messages (retries)
             if (id != dmq::ACK_REMOTE_ID) {
-                std::lock_guard<dmq::RecursiveMutex> lock(m_mutex);
+                dmq::LockGuard<dmq::RecursiveMutex> lock(m_mutex);
                 if (m_history[id].is_duplicate(seqNum)) {
                     return 0; // Silently drop duplicate
                 }
             }
 
+            dmq::IRemoteInvoker* invoker = nullptr;
             std::shared_ptr<void> channelLifetime; // keeps channel alive across lock gap
             {
-                std::lock_guard<dmq::RecursiveMutex> lock(m_mutex);
+                dmq::LockGuard<dmq::RecursiveMutex> lock(m_mutex);
                 auto it = m_channels.find(id);
                 if (it != m_channels.end()) {
                     channelLifetime = it->second.channel;
@@ -90,7 +100,9 @@ public:
 
             // Invoke outside the lock to prevent deadlocks and allow re-entry
             if (invoker) {
-                invoker->Invoke(m_inputStream);
+                invoker->Invoke(inputStream);
+            } else {
+                OnChannelError(id, dmq::DelegateError::ERR_NO_DISPATCHER, 0);
             }
         }
         return result;
@@ -129,7 +141,7 @@ public:
     // Register a local handler for a remote topic using a `std::function`.
     template <typename T>
     void RegisterHandler(dmq::DelegateRemoteId remoteId, dmq::ISerializer<void(T)>& serializer, std::function<void(T)> func) {
-        std::lock_guard<dmq::RecursiveMutex> lock(m_mutex);
+        dmq::LockGuard<dmq::RecursiveMutex> lock(m_mutex);
         auto channel = dmq::xmake_shared<dmq::RemoteChannel<void(T)>>(*m_transport, serializer);
 
         // Use Bind() to register the callback for incoming calls.
@@ -138,13 +150,19 @@ public:
         AttachErrorHandler(channel);
 
         m_channels[remoteId] = { channel, channel->GetEndpoint() };
-        m_channelTypes.emplace(remoteId, std::type_index(typeid(T)));
+        auto typeIdx = std::type_index(typeid(T));
+        auto it = m_channelTypes.find(remoteId);
+        if (it != m_channelTypes.end()) {
+            ASSERT_TRUE(it->second == typeIdx);
+        } else {
+            m_channelTypes.emplace(remoteId, typeIdx);
+        }
     }
 
     // Register a local handler for a remote topic using a raw lambda or functor.
     template <typename T, typename F, typename = std::enable_if_t<dmq::trait::is_callable<F>::value>>
     void RegisterHandler(dmq::DelegateRemoteId remoteId, dmq::ISerializer<void(T)>& serializer, F&& func) {
-        std::lock_guard<dmq::RecursiveMutex> lock(m_mutex);
+        dmq::LockGuard<dmq::RecursiveMutex> lock(m_mutex);
         auto channel = dmq::xmake_shared<dmq::RemoteChannel<void(T)>>(*m_transport, serializer);
 
         // Use Bind() to register the callback for incoming calls.
@@ -153,13 +171,19 @@ public:
         AttachErrorHandler(channel);
 
         m_channels[remoteId] = { channel, channel->GetEndpoint() };
-        m_channelTypes.emplace(remoteId, std::type_index(typeid(T)));
+        auto typeIdx = std::type_index(typeid(T));
+        auto it = m_channelTypes.find(remoteId);
+        if (it != m_channelTypes.end()) {
+            ASSERT_TRUE(it->second == typeIdx);
+        } else {
+            m_channelTypes.emplace(remoteId, typeIdx);
+        }
     }
 
 private:
     // Get the remote ID for a topic.
     bool GetRemoteId(const dmq::xstring& topic, dmq::DelegateRemoteId& remoteId) {
-        std::lock_guard<dmq::RecursiveMutex> lock(m_mutex);
+        dmq::LockGuard<dmq::RecursiveMutex> lock(m_mutex);
         auto it = m_topicToRemoteId.find(topic);
         if (it != m_topicToRemoteId.end()) {
             remoteId = it->second;
@@ -170,7 +194,7 @@ private:
 
     // Get the topic name for a remote ID (error path only — linear scan is fine).
     bool GetTopicName(dmq::DelegateRemoteId remoteId, dmq::xstring& topic) {
-        std::lock_guard<dmq::RecursiveMutex> lock(m_mutex);
+        dmq::LockGuard<dmq::RecursiveMutex> lock(m_mutex);
         for (auto& [t, id] : m_topicToRemoteId) {
             if (id == remoteId) { topic = t; return true; }
         }
@@ -187,17 +211,25 @@ private:
         bool shouldFire = false;
         dmq::xstring topic;
         {
-            std::lock_guard<dmq::RecursiveMutex> lock(m_mutex);
+            dmq::LockGuard<dmq::RecursiveMutex> lock(m_mutex);
             for (auto& [t, rid] : m_topicToRemoteId) {
                 if (rid == id) { topic = t; break; }
             }
-            if (!topic.empty()) {
-                uint8_t bit = uint8_t(1u << static_cast<int>(error));
-                auto& bits = m_reportedErrors[topic];
-                if (!(bits & bit)) {
-                    bits |= bit;
-                    shouldFire = true;
-                }
+            if (topic.empty()) {
+                // xostringstream keeps this portable: under DMQ_ALLOCATOR, xstring and
+                // std::string are different types, so std::to_string concatenation
+                // would not compile.
+                dmq::xostringstream os;
+                os << "UnknownRemoteId:" << id;
+                topic = os.str();
+            }
+            uint16_t bit = uint16_t(1u << static_cast<int>(error));
+            auto& bits = m_reportedErrors[topic];
+            if (!(bits & bit)) {
+                bits |= bit;
+                shouldFire = true;
+            } else if (m_continuousErrors) {
+                shouldFire = true;
             }
         }
         if (shouldFire)
@@ -205,7 +237,7 @@ private:
     }
 
     void ResetErrors() {
-        std::lock_guard<dmq::RecursiveMutex> lock(m_mutex);
+        dmq::LockGuard<dmq::RecursiveMutex> lock(m_mutex);
         m_reportedErrors.clear();
     }
 
@@ -216,7 +248,7 @@ private:
 
     template <typename T>
     std::shared_ptr<dmq::RemoteChannel<void(T)>> GetOrCreateChannel(dmq::DelegateRemoteId remoteId, dmq::ISerializer<void(T)>& serializer) {
-        std::lock_guard<dmq::RecursiveMutex> lock(m_mutex);
+        dmq::LockGuard<dmq::RecursiveMutex> lock(m_mutex);
         std::shared_ptr<dmq::RemoteChannel<void(T)>> channel;
 
         auto it = m_channels.find(remoteId);
@@ -224,7 +256,11 @@ private:
             // Type safety: catch remoteId reused with a different T
             auto itType = m_channelTypes.find(remoteId);
             if (itType != m_channelTypes.end()) {
-                ASSERT_TRUE(itType->second == std::type_index(typeid(T)));
+                if (itType->second != std::type_index(typeid(T))) {
+                    // Report before faulting so error handlers can log the mismatch
+                    OnChannelError(remoteId, dmq::DelegateError::ERR_TYPE_MISMATCH, 0);
+                    ASSERT();
+                }
             }
             channel = std::static_pointer_cast<dmq::RemoteChannel<void(T)>>(it->second.channel);
         } else {
@@ -245,32 +281,35 @@ private:
 
     dmq::transport::ITransport* m_transport;
     dmq::IThread* m_sendThread = nullptr;
+    bool m_continuousErrors = false;
     dmq::RecursiveMutex m_mutex;
+    dmq::Mutex m_receiveMutex;
     dmq::xmap<dmq::xstring, dmq::DelegateRemoteId> m_topicToRemoteId;
     dmq::xmap<dmq::DelegateRemoteId, ChannelInvoker> m_channels;
     dmq::xmap<dmq::DelegateRemoteId, std::type_index> m_channelTypes;
-    dmq::xmap<dmq::xstring, uint8_t> m_reportedErrors;
+    dmq::xmap<dmq::xstring, uint16_t> m_reportedErrors;
     dmq::Signal<void(const dmq::xstring&, dmq::DelegateError)> m_errorSignal;
 
     // --- Duplicate Filtering ---
     struct SeqHistory {
         static constexpr size_t SIZE = DMQ_SEQ_HISTORY_SIZE;
         uint16_t buffer[SIZE];
+        bool valid[SIZE];
         size_t head = 0;
 
-        SeqHistory() { std::fill(buffer, buffer + SIZE, uint16_t(0xFFFF)); }
+        SeqHistory() { std::fill(valid, valid + SIZE, false); }
 
         bool is_duplicate(uint16_t seq) {
             for (size_t i = 0; i < SIZE; ++i) {
-                if (buffer[i] == seq) return true;
+                if (valid[i] && buffer[i] == seq) return true;
             }
             buffer[head] = seq;
+            valid[head] = true;
             head = (head + 1) % SIZE;
             return false;
         }
     };
     dmq::xmap<dmq::DelegateRemoteId, SeqHistory> m_history;
-    dmq::xstringstream m_inputStream;
 };
 
 } // namespace dmq::databus

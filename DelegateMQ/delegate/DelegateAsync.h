@@ -51,6 +51,7 @@
 #include "Delegate.h"
 #include "IThread.h"
 #include "IInvoker.h"
+#include <atomic>
 #include <tuple>
 
 namespace dmq {
@@ -113,6 +114,9 @@ public:
     typedef RetType(*FreeFunc)(Args...);
     using ClassType = DelegateFreeAsync<RetType(Args...)>;
     using BaseType = DelegateFree<RetType(Args...)>;
+
+    static_assert(!(std::disjunction_v<trait::is_non_const_shared_ptr_reference<Args>...>),
+        "Non-const std::shared_ptr reference/pointer arguments are not allowed");
 
     /// @brief Constructor to create a class instance.
     /// @param[in] func The target free function to store.
@@ -281,20 +285,15 @@ public:
                 // Dispatch message onto the callback destination thread. Invoke()
                 // will be called by the destintation thread. 
                 bool success = thread->DispatchDelegate(msg);
-                (void)success;
+                if (!success) {
+                    LOG_ERROR("DelegateAsync dispatch failed");
+                }
             }
 
             // Do not wait for destination thread return value from async function call
             return RetType();
 
-            // Check if any argument is a shared_ptr with wrong usage
-            // std::shared_ptr reference arguments are not allowed with asynchronous delegates as the behavior is 
-            // undefined. In other words:
-            // void MyFunc(std::shared_ptr<T> data)		// Ok!
-            // void MyFunc(std::shared_ptr<T>& data)	// Error if DelegateAsync or DelegateSpAsync target!
-            static_assert(!(
-                std::disjunction_v<trait::is_shared_ptr_reference<Args>...>),
-                "std::shared_ptr reference argument not allowed");
+
         }
     }
 
@@ -342,7 +341,7 @@ private:
     IThread* m_thread = nullptr;
 
     /// Flag to control synchronous vs asynchronous target invoke behavior.
-    bool m_sync = false;
+    std::atomic<bool> m_sync{false};
 
     /// The delegate message priority
     Priority m_priority = Priority::NORMAL;
@@ -366,6 +365,9 @@ public:
     typedef RetType(TClass::* ConstMemberFunc)(Args...) const;
     using ClassType = DelegateMemberAsync<TClass, RetType(Args...)>;
     using BaseType = DelegateMember<TClass, RetType(Args...)>;
+
+    static_assert(!(std::disjunction_v<trait::is_non_const_shared_ptr_reference<Args>...>),
+        "Non-const std::shared_ptr reference/pointer arguments are not allowed");
 
     /// @brief Constructor to create a class instance.
     /// @param[in] object The target object pointer to store.
@@ -595,20 +597,15 @@ public:
                 // Dispatch message onto the callback destination thread. Invoke()
                 // will be called by the destintation thread. 
                 bool success = thread->DispatchDelegate(msg);
-                (void)success;
+                if (!success) {
+                    LOG_ERROR("DelegateAsync dispatch failed");
+                }
             }
 
             // Do not wait for destination thread return value from async function call
             return RetType();
 
-            // Check if any argument is a shared_ptr with wrong usage
-            // std::shared_ptr reference arguments are not allowed with asynchronous delegates as the behavior is 
-            // undefined. In other words:
-            // void MyFunc(std::shared_ptr<T> data)		// Ok!
-            // void MyFunc(std::shared_ptr<T>& data)	// Error if DelegateAsync or DelegateSpAsync target!
-            static_assert(!(
-                std::disjunction_v<trait::is_shared_ptr_reference<Args>...>),
-                "std::shared_ptr reference argument not allowed");
+
         }
     }
 
@@ -656,7 +653,7 @@ private:
     IThread* m_thread = nullptr;
 
     /// Flag to control synchronous vs asynchronous target invoke behavior.
-    bool m_sync = false;
+    std::atomic<bool> m_sync{false};
 
     /// The delegate message priority
     Priority m_priority = Priority::NORMAL;
@@ -681,6 +678,9 @@ public:
     typedef RetType(TClass::* ConstMemberFunc)(Args...) const;
     using ClassType = DelegateMemberAsyncSp<TClass, RetType(Args...)>;
     using BaseType = DelegateMemberSp<TClass, RetType(Args...)>;
+
+    static_assert(!(std::disjunction_v<trait::is_non_const_shared_ptr_reference<Args>...>),
+        "Non-const std::shared_ptr reference/pointer arguments are not allowed");
 
     DelegateMemberAsyncSp(SharedPtr object, MemberFunc func, IThread& thread) : BaseType(object, func), m_thread(&thread) {
         Bind(object, func, thread);
@@ -838,20 +838,15 @@ public:
                 // Dispatch message onto the callback destination thread. Invoke()
                 // will be called by the destintation thread. 
                 bool success = thread->DispatchDelegate(msg);
-                (void)success;
+                if (!success) {
+                    LOG_ERROR("DelegateAsync dispatch failed");
+                }
             }
 
             // Do not wait for destination thread return value from async function call
             return RetType();
 
-            // Check if any argument is a shared_ptr with wrong usage
-            // std::shared_ptr reference arguments are not allowed with asynchronous delegates as the behavior is 
-            // undefined. In other words:
-            // void MyFunc(std::shared_ptr<T> data)		// Ok!
-            // void MyFunc(std::shared_ptr<T>& data)	// Error if DelegateAsync or DelegateSpAsync target!
-            static_assert(!(
-                std::disjunction_v<trait::is_shared_ptr_reference<Args>...>),
-                "std::shared_ptr reference argument not allowed");
+
         }
     }
 
@@ -899,7 +894,7 @@ private:
     IThread* m_thread = nullptr;
 
     /// Flag to control synchronous vs asynchronous target invoke behavior.
-    bool m_sync = false;
+    std::atomic<bool> m_sync{false};
 
     /// The delegate message priority
     Priority m_priority = Priority::NORMAL;
@@ -925,6 +920,9 @@ public:
     using FunctionType = std::function<RetType(Args...)>;
     using ClassType = DelegateFunctionAsync<RetType(Args...)>;
     using BaseType = DelegateFunction<RetType(Args...)>;
+
+    static_assert(!(std::disjunction_v<trait::is_non_const_shared_ptr_reference<Args>...>),
+        "Non-const std::shared_ptr reference/pointer arguments are not allowed");
 
     /// @brief Constructor to create a class instance.
     /// @param[in] func The target `std::function` to store.
@@ -1093,20 +1091,15 @@ public:
                 // Dispatch message onto the callback destination thread. Invoke()
                 // will be called by the destintation thread. 
                 bool success = thread->DispatchDelegate(msg);
-                (void)success;
+                if (!success) {
+                    LOG_ERROR("DelegateAsync dispatch failed");
+                }
             }
 
             // Do not wait for destination thread return value from async function call
             return RetType();
 
-            // Check if any argument is a shared_ptr with wrong usage
-            // std::shared_ptr reference arguments are not allowed with asynchronous delegates as the behavior is 
-            // undefined. In other words:
-            // void MyFunc(std::shared_ptr<T> data)		// Ok!
-            // void MyFunc(std::shared_ptr<T>& data)	// Error if DelegateAsync or DelegateSpAsync target!
-            static_assert(!(
-                std::disjunction_v<trait::is_shared_ptr_reference<Args>...>),
-                "std::shared_ptr reference argument not allowed");
+
         }
     }
 
@@ -1154,7 +1147,7 @@ private:
     IThread* m_thread = nullptr;
 
     /// Flag to control synchronous vs asynchronous target invoke behavior.
-    bool m_sync = false;
+    std::atomic<bool> m_sync{false};
 
     /// The delegate message priority
     Priority m_priority = Priority::NORMAL;

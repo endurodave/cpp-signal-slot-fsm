@@ -30,20 +30,13 @@
 #include "./extras/util/Timer.h"
 #include "ThreadMsg.h"
 #include <thread>
-#include <queue>
+#include <deque>
 #include <atomic>
 #include <condition_variable>
 #include <future>
 #include <optional>
 
 namespace dmq::os {
-
-// Comparator for priority queue
-struct ThreadMsgComparator {
-    bool operator()(const std::shared_ptr<ThreadMsg>& a, const std::shared_ptr<ThreadMsg>& b) const {
-        return static_cast<int>(a->GetPriority()) < static_cast<int>(b->GetPriority());
-    }
-};
 
 /// @brief Policy applied when the thread message queue is full.
 /// @details Only meaningful when maxQueueSize > 0.
@@ -172,13 +165,11 @@ private:
     std::atomic<bool> m_exit;
 
 #ifdef DMQ_ALLOCATOR
-    std::priority_queue<std::shared_ptr<ThreadMsg>,
-        std::vector<std::shared_ptr<ThreadMsg>, stl_allocator<std::shared_ptr<ThreadMsg>>>,
-        ThreadMsgComparator> m_queue;
+    std::deque<std::shared_ptr<ThreadMsg>, stl_allocator<std::shared_ptr<ThreadMsg>>> m_highQueue;
+    std::deque<std::shared_ptr<ThreadMsg>, stl_allocator<std::shared_ptr<ThreadMsg>>> m_normalQueue;
 #else
-    std::priority_queue<std::shared_ptr<ThreadMsg>,
-        std::vector<std::shared_ptr<ThreadMsg>>,
-        ThreadMsgComparator> m_queue;
+    std::deque<std::shared_ptr<ThreadMsg>> m_highQueue;
+    std::deque<std::shared_ptr<ThreadMsg>> m_normalQueue;
 #endif
     std::mutex m_mutex;
     std::condition_variable m_cv;
@@ -208,6 +199,9 @@ private:
     Thread* m_watchdogNext = nullptr;
 
 #if defined(DMQ_DATABUS_TOOLS)
+    // Separate mutex for statistics to reduce contention on m_mutex
+    std::mutex m_statsMutex;
+
     // Monitoring statistics members
     size_t m_queueDepthMaxWindow = 0;
     size_t m_queueDepthMaxAll = 0;

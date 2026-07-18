@@ -160,7 +160,8 @@ public:
         // Mark the shared state dead under the lock. Any concurrent Disconnect()
         // that races with this will either complete its removal first (holding the
         // lock) or see alive=false and skip removal. Either way, no UAF.
-        dmq::LockGuard<RecursiveMutex> lock(m_state->mtx);
+        dmq::LockGuard<RecursiveMutex> lock(m_mutex);
+        dmq::LockGuard<RecursiveMutex> stateLock(m_state->mtx);
         m_state->alive = false;
         m_state->delegates.clear();
     }
@@ -179,10 +180,11 @@ public:
         auto copy = std::shared_ptr<DelegateType>(delegate.Clone(), std::default_delete<DelegateType>(), ::dmq::stl_allocator<std::remove_const_t<DelegateType>>());
         if (!copy)
             BAD_ALLOC();
-        {
-            dmq::LockGuard<RecursiveMutex> lock(m_state->mtx);
-            m_state->delegates.push_back(copy);
-        }
+
+        dmq::LockGuard<RecursiveMutex> lock(m_mutex);
+        dmq::LockGuard<RecursiveMutex> stateLock(m_state->mtx);
+        m_state->delegates.push_back(copy);
+
         return ScopedConnection(detail::Connection(
             std::static_pointer_cast<void>(m_state),
             std::static_pointer_cast<void>(copy),
@@ -213,18 +215,25 @@ public:
     };
 
     Snapshot GetSnapshot() const {
+        dmq::LockGuard<RecursiveMutex> lock(m_mutex);
+        dmq::LockGuard<RecursiveMutex> stateLock(m_state->mtx);
+
         Snapshot s;
-        {
-            dmq::LockGuard<RecursiveMutex> lock(m_state->mtx);
-            s.count = m_state->delegates.size();
-            if (s.count <= SIGNAL_SBO_COUNT) {
-                size_t i = 0;
-                for (auto& d : m_state->delegates) {
-                    s.small_buf[i++] = d;
-                }
-            } else {
-                s.large_buf = m_state->delegates;
+        s.count = m_state->delegates.size();
+        if (s.count <= SIGNAL_SBO_COUNT) {
+            size_t i = 0;
+            for (auto& d : m_state->delegates) {
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunsafe-buffer-usage"
+#endif
+                s.small_buf[i++] = d;
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
             }
+        } else {
+            s.large_buf = m_state->delegates;
         }
         return s;
     }
@@ -233,8 +242,15 @@ public:
     static void InvokeSnapshot(const Snapshot& s, Args... args) {
         if (s.count <= SIGNAL_SBO_COUNT) {
             for (size_t i = 0; i < s.count; ++i) {
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunsafe-buffer-usage"
+#endif
                 if (s.small_buf[i])
                     (*s.small_buf[i])(args...);
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
             }
         } else {
             for (auto& d : s.large_buf) {
@@ -246,7 +262,8 @@ public:
 
     /// @brief Number of currently connected subscribers.
     std::size_t Size() const {
-        dmq::LockGuard<RecursiveMutex> lock(m_state->mtx);
+        dmq::LockGuard<RecursiveMutex> lock(m_mutex);
+        dmq::LockGuard<RecursiveMutex> stateLock(m_state->mtx);
         return m_state->delegates.size();
     }
 
@@ -254,8 +271,17 @@ public:
 
     /// @brief Disconnect all subscribers.
     void Clear() {
-        dmq::LockGuard<RecursiveMutex> lock(m_state->mtx);
-        m_state->delegates.clear();
+        std::shared_ptr<State> oldState;
+        {
+            dmq::LockGuard<RecursiveMutex> lock(m_mutex);
+            oldState = m_state;
+            m_state = xmake_shared<State>();
+        }
+        {
+            dmq::LockGuard<RecursiveMutex> lock(oldState->mtx);
+            oldState->alive = false;
+            oldState->delegates.clear();
+        }
     }
 
     XALLOCATOR
@@ -275,6 +301,7 @@ private:
         xlist<std::shared_ptr<DelegateType>> delegates;
         XALLOCATOR
     };
+    mutable RecursiveMutex m_mutex;
     std::shared_ptr<State> m_state = xmake_shared<State>();
 };
 

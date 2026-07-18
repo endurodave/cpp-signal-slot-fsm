@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <stddef.h>
+#include <atomic>
 
 // @see https://github.com/endurodave/xallocator
 // David Lafreniere
@@ -29,7 +30,7 @@ public:
 	XallocInitDestroy();
 	~XallocInitDestroy();
 private:
-	static int32_t refCount;
+	static std::atomic<int32_t> refCount;
 };
 } // namespace dmq
 static dmq::XallocInitDestroy xallocInitDestroy;
@@ -115,10 +116,13 @@ void xalloc_stats();
     //
     //   // GOOD: Allocates fixed-block memory (Uses XALLOCATOR)
     //   std::shared_ptr<MyMsg> msg(new MyMsg());
+    #include "delegate/DelegateOpt.h"
     #define XALLOCATOR \
         public: \
             void* operator new(size_t size) { \
-                return xmalloc(size); \
+                void* p = xmalloc(size); \
+                if (!p) BAD_ALLOC(); \
+                return p; \
             } \
             void* operator new(size_t /*size*/, void* mem) { \
                 return mem; \
@@ -127,7 +131,9 @@ void xalloc_stats();
                 return xmalloc(size); \
             } \
             void* operator new[](size_t size) { \
-                return xmalloc(size); \
+                void* p = xmalloc(size); \
+                if (!p) BAD_ALLOC(); \
+                return p; \
             } \
             void operator delete(void* pObject) { \
                 xfree(pObject); \

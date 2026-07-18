@@ -146,7 +146,7 @@ bool Thread::IsCurrentThread()
 size_t Thread::GetQueueSize()
 {
     lock_guard<mutex> lock(m_mutex);
-    return m_queue.size();
+    return (m_highQueue.size() + m_normalQueue.size());
 }
 
 void Thread::Sleep(dmq::Duration timeout) {
@@ -191,7 +191,10 @@ void Thread::ExitThread()
 
         // Explicitly allow Exit message to bypass the MAX_QUEUE_SIZE limit.
         // We do not wait on m_cvNotFull here to prevent deadlock during shutdown.
-        m_queue.push(threadMsg);
+        if (threadMsg->GetPriority() == dmq::Priority::HIGH)
+            m_highQueue.push_back(threadMsg);
+        else
+            m_normalQueue.push_back(threadMsg);
 
         // Wake up consumers
         m_cv.notify_one();
@@ -219,8 +222,8 @@ void Thread::ExitThread()
     {
         lock_guard<mutex> lock(m_mutex);
         m_thread.reset();
-        while (!m_queue.empty())
-            m_queue.pop();
+        m_highQueue.clear();
+        m_normalQueue.clear();
 
         // Final cleanup notification
         m_cvNotFull.notify_all();
@@ -242,7 +245,7 @@ bool Thread::DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg)
     std::unique_lock<std::mutex> lk(m_mutex);
 
     // [BACK PRESSURE / DROP / FAULT / TIMEOUT LOGIC]
-    if (MAX_QUEUE_SIZE > 0 && m_queue.size() >= MAX_QUEUE_SIZE)
+    if (MAX_QUEUE_SIZE > 0 && (m_highQueue.size() + m_normalQueue.size()) >= MAX_QUEUE_SIZE)
     {
         if (FULL_POLICY == FullPolicy::DROP)
             return false;  // silently discard — caller is not stalled, no allocation wasted
@@ -257,7 +260,7 @@ bool Thread::DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg)
         if (FULL_POLICY == FullPolicy::TIMEOUT)
         {
             bool hasSpace = m_cvNotFull.wait_for(lk, m_dispatchTimeout, [this]() {
-                return m_queue.size() < MAX_QUEUE_SIZE || m_exit.load();
+                return (m_highQueue.size() + m_normalQueue.size()) < MAX_QUEUE_SIZE || m_exit.load();
             });
             if (!hasSpace) {
                 printf("[Thread] WARNING: Queue post timed out on '%s' — possible deadlock. Message dropped.\n", THREAD_NAME.c_str());
@@ -278,16 +281,27 @@ bool Thread::DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg)
     if (m_exit.load())
         return false;
 
-    m_queue.push(threadMsg);
+    if (threadMsg->GetPriority() == dmq::Priority::HIGH)
+        m_highQueue.push_back(threadMsg);
+    else
+        m_normalQueue.push_back(threadMsg);
 
 #if defined(DMQ_DATABUS_TOOLS)
-    // Update monitoring stats
-    size_t currentDepth = m_queue.size();
-    if (currentDepth > m_queueDepthMaxWindow) m_queueDepthMaxWindow = currentDepth;
-    if (currentDepth > m_queueDepthMaxAll) m_queueDepthMaxAll = currentDepth;
+    // Snapshot size while holding m_mutex
+    size_t currentDepth = (m_highQueue.size() + m_normalQueue.size());
 #endif
 
     m_cv.notify_one();
+    lk.unlock(); // Release producer-blocking lock early
+
+#if defined(DMQ_DATABUS_TOOLS)
+    // Update monitoring stats under the separate stats mutex
+    {
+        lock_guard<mutex> lock(m_statsMutex);
+        if (currentDepth > m_queueDepthMaxWindow) m_queueDepthMaxWindow = currentDepth;
+        if (currentDepth > m_queueDepthMaxAll) m_queueDepthMaxAll = currentDepth;
+    }
+#endif
 
     return true;
 }
@@ -387,7 +401,7 @@ void Thread::Process()
             // Wait for message to be added to the queue.
             // If watchdog active, use a finite timeout so we can periodically update 
             // m_lastAliveTime while idle. Otherwise, block forever.
-            auto predicate = [this]() { return !m_queue.empty() || m_exit.load(); };
+            auto predicate = [this]() { return !(m_highQueue.empty() && m_normalQueue.empty()) || m_exit.load(); };
             if (watchdogTimeout.count() > 0)
             {
                 // Wake up frequently to ensure heartbeat is updated while idle
@@ -402,15 +416,20 @@ void Thread::Process()
             m_lastAliveTime.store(Timer::GetNow());
 
             // If empty and exit is true, we should exit.
-            if (m_queue.empty())
+            if ((m_highQueue.empty() && m_normalQueue.empty()))
             {
                 if (m_exit.load()) { t_self_exit = nullptr; return; }
                 continue;
             }
 
             // Get highest priority message within queue
-            msg = m_queue.top();
-            m_queue.pop();
+            if (!m_highQueue.empty()) {
+                msg = m_highQueue.front();
+                m_highQueue.pop_front();
+            } else {
+                msg = m_normalQueue.front();
+                m_normalQueue.pop_front();
+            }
 
             // Unblock producers now that space is available
             if (MAX_QUEUE_SIZE > 0)
@@ -427,7 +446,7 @@ void Thread::Process()
                 // Update latency stats before invoking
                 dmq::Duration latency = Timer::GetNow() - msg->GetEnqueueTime();
                 {
-                    lock_guard<mutex> lock(m_mutex);
+                    lock_guard<mutex> lock(m_statsMutex);
                     m_latencyTotalWindow += latency;
                     m_latencyCountWindow++;
                     if (latency > m_latencyMaxWindow) m_latencyMaxWindow = latency;
@@ -463,7 +482,7 @@ void Thread::Process()
 #if defined(DMQ_DATABUS_TOOLS)
                         dmq::Duration invokeTime = Timer::GetNow() - start;
                         {
-                            lock_guard<mutex> lock(m_mutex);
+                            lock_guard<mutex> lock(m_statsMutex);
                             m_invokeTotalWindow += invokeTime;
                             m_invokeCountWindow++;
                             if (invokeTime > m_invokeMaxWindow) m_invokeMaxWindow = invokeTime;
@@ -497,11 +516,14 @@ void Thread::Process()
 //----------------------------------------------------------------------------
 Thread::ThreadStats Thread::SnapshotStats()
 {
-    lock_guard<mutex> lock(m_mutex);
+    // Need m_mutex only for (m_highQueue.size() + m_normalQueue.size())
+    size_t currentDepth = GetQueueSize();
+
+    lock_guard<mutex> lock(m_statsMutex);
     ThreadStats stats;
     stats.cpu_name = CPU_NAME;
     stats.thread_name = THREAD_NAME;
-    stats.queue_depth = m_queue.size();
+    stats.queue_depth = currentDepth;
     stats.queue_depth_max_window = m_queueDepthMaxWindow;
     stats.queue_depth_max_all = m_queueDepthMaxAll;
     stats.queue_size_limit = MAX_QUEUE_SIZE;
@@ -527,7 +549,7 @@ Thread::ThreadStats Thread::SnapshotStats()
     stats.dispatch_count = m_dispatchCountAll;
 
     // Reset windowed stats
-    m_queueDepthMaxWindow = stats.queue_depth;
+    m_queueDepthMaxWindow = 0;
     m_latencyTotalWindow = dmq::Duration(0);
     m_latencyCountWindow = 0;
     m_latencyMaxWindow = dmq::Duration(0);
