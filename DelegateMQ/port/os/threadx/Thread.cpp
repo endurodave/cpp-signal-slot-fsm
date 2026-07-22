@@ -119,17 +119,13 @@ bool Thread::CreateThread(std::optional<dmq::Duration> watchdogTimeout)
         ret = tx_thread_create(&m_thread,
                                (CHAR*)THREAD_NAME.c_str(),
                                &Thread::Process,
-                               (ULONG)(ULONG_PTR)this, // Pass 'this' as entry input (truncated on 64-bit)
+                               reinterpret_cast<ULONG>(this), // Pass 'this' as entry input
                                m_stackMemory.get(),
                                stackSizeWords * sizeof(ULONG),
                                m_priority,
                                m_priority,
                                TX_NO_TIME_SLICE,
                                TX_DONT_START);
-
-        // Store 'this' pointer in user data to avoid truncation issues on 64-bit.
-        // We set this BEFORE resuming the thread to avoid a race condition in Process().
-        m_thread.tx_thread_user_data = (ULONG_PTR)this;
 
         if (ret == TX_SUCCESS) {
             tx_thread_resume(&m_thread);
@@ -199,30 +195,42 @@ void Thread::ExitThread()
     {
         m_exit.store(true);
 
-        // Send exit message
-        ThreadMsg* msg = new (std::nothrow) ThreadMsg(MSG_EXIT_THREAD);
-        if (msg)
-        {
-            // Wait forever to ensure message is sent
-            if (tx_queue_send(&m_queue, &msg, TX_WAIT_FOREVER) != TX_SUCCESS)
-            {
-                delete msg; // Failed to send, prevent leak
-            }
-        }
-
-        // Wait for thread to terminate using semaphore logic.
-        // We only wait if we are NOT the thread itself (avoid deadlock).
-        // If tx_thread_identify() returns NULL (ISR context), we also shouldn't block.
+        // Determine self-exit BEFORE attempting to enqueue the exit message.
+        // If this thread is destroying itself from within its own dispatched
+        // callback, it is not consuming its own queue right now -- it is
+        // blocked here, inside ExitThread(). A blocking tx_queue_send() would
+        // deadlock forever if the queue happened to be full. No message needs
+        // to be queued in that case: Run()'s dispatch loop already checks
+        // m_selfExitPtr immediately after the current callback invoke
+        // returns, and unwinds without touching 'this' again.
         TX_THREAD* currentThread = tx_thread_identify();
-        if (currentThread != &m_thread && currentThread != nullptr) {
-            // Wait for Run() to signal completion
-            tx_semaphore_get(&m_exitSem, TX_WAIT_FOREVER);
-        }
+        bool isSelfExit = (currentThread == &m_thread);
 
-        // Force terminate if still running (safety net)
-        // tx_thread_terminate returns TX_SUCCESS if terminated or TX_THREAD_ERROR if already terminated
-        tx_thread_terminate(&m_thread);
-        tx_thread_delete(&m_thread);
+        if (isSelfExit) {
+            if (m_selfExitPtr) *m_selfExitPtr = true;
+        } else {
+            // Send exit message
+            ThreadMsg* msg = new (std::nothrow) ThreadMsg(MSG_EXIT_THREAD);
+            if (msg)
+            {
+                // Wait forever to ensure message is sent
+                if (tx_queue_send(&m_queue, &msg, TX_WAIT_FOREVER) != TX_SUCCESS)
+                {
+                    delete msg; // Failed to send, prevent leak
+                }
+            }
+
+            // If tx_thread_identify() returns NULL (ISR context), we shouldn't block.
+            if (currentThread != nullptr) {
+                // Wait for Run() to signal completion
+                tx_semaphore_get(&m_exitSem, TX_WAIT_FOREVER);
+            }
+
+            // Force terminate if still running (safety net)
+            // tx_thread_terminate returns TX_SUCCESS if terminated or TX_THREAD_ERROR if already terminated
+            tx_thread_terminate(&m_thread);
+            tx_thread_delete(&m_thread);
+        }
 
         ThreadMsg* drainMsg = nullptr;
         while (tx_queue_receive(&m_queue, &drainMsg, TX_NO_WAIT) == TX_SUCCESS) {
@@ -273,7 +281,7 @@ size_t Thread::GetQueueSize()
         TX_THREAD* suspension_list;
         ULONG suspension_count;
         TX_QUEUE* next_queue;
-        if (tx_queue_info_get(&m_queue, TX_NULL, &enqueued, &available, &suspension_list, &suspension_count, &next_queue) == TX_SUCCESS) {
+        if (tx_queue_info_get(&m_queue, nullptr, &enqueued, &available, &suspension_list, &suspension_count, &next_queue) == TX_SUCCESS) {
             return (size_t)enqueued;
         }
     }
@@ -351,11 +359,8 @@ bool Thread::DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg)
 //----------------------------------------------------------------------------
 void Thread::Process(ULONG instance)
 {
-    (void)instance;
-    // Retrieve the pointer from user data which is ULONG_PTR (pointer width)
-    TX_THREAD* current_thread = tx_thread_identify();
-    Thread* thread = reinterpret_cast<Thread*>(current_thread->tx_thread_user_data);
-    
+    Thread* thread = reinterpret_cast<Thread*>(instance);
+
     ASSERT_TRUE(thread != nullptr);
     thread->Run();
 }
@@ -392,21 +397,13 @@ void Thread::ThreadCheck()
 //----------------------------------------------------------------------------
 void Thread::WatchdogCheckAll()
 {
-    Thread* snapshot[dmq::MAX_WATCHDOG_THREADS];
-    int count = 0;
-
+    const std::lock_guard<dmq::RecursiveMutex> lock(GetWatchdogLock());
+    Thread* p = GetWatchdogHead();
+    while (p != nullptr)
     {
-        const std::lock_guard<dmq::RecursiveMutex> lock(GetWatchdogLock());
-        Thread* p = GetWatchdogHead();
-        while (p != nullptr && count < static_cast<int>(dmq::MAX_WATCHDOG_THREADS))
-        {
-            snapshot[count++] = p;
-            p = p->m_watchdogNext;
-        }
+        p->WatchdogCheck();
+        p = p->m_watchdogNext;
     }
-
-    for (int i = 0; i < count; i++)
-        snapshot[i]->WatchdogCheck();
 }
 
 //----------------------------------------------------------------------------
@@ -432,8 +429,11 @@ dmq::RecursiveMutex& Thread::GetWatchdogLock()
 //----------------------------------------------------------------------------
 void Thread::Run()
 {
+    bool selfExit = false;
+    m_selfExitPtr = &selfExit;
+
     ThreadMsg* msg = nullptr;
-    while (!m_exit.load())
+    while (!selfExit && !m_exit.load())
     {
         dmq::Duration timeout;
         {
@@ -486,6 +486,18 @@ void Thread::Run()
                 success = invoker->Invoke(delegateMsg);
                 ASSERT_TRUE(success);
             }
+            catch (const std::bad_alloc& e) {
+                std::cerr << "[Thread:" << THREAD_NAME << "] Unhandled bad_alloc in delegate callback: " << e.what() << std::endl;
+                ASSERT();
+            }
+            catch (const std::invalid_argument& e) {
+                std::cerr << "[Thread:" << THREAD_NAME << "] Unhandled invalid_argument in delegate callback: " << e.what() << std::endl;
+                ASSERT();
+            }
+            catch (const std::runtime_error& e) {
+                std::cerr << "[Thread:" << THREAD_NAME << "] Unhandled runtime_error in delegate callback: " << e.what() << std::endl;
+                ASSERT();
+            }
             catch (const std::exception& e) {
                 printf("[Thread:%s] Unhandled exception in delegate callback: %s\n", THREAD_NAME.c_str(), e.what());
                 ASSERT();
@@ -496,8 +508,14 @@ void Thread::Run()
             }
 #else
             bool success = invoker->Invoke(delegateMsg);
-            ASSERT_TRUE(success);
+            if (!selfExit) ASSERT_TRUE(success);
 #endif
+            if (selfExit) {
+                delete msg;
+                m_selfExitPtr = nullptr;
+                return;
+            }
+
 #if defined(DMQ_DATABUS_TOOLS)
             dmq::Duration invokeTime = Timer::GetNow() - start;
             {
@@ -520,6 +538,7 @@ void Thread::Run()
 
     // Signal ExitThread() that the loop has exited
     tx_semaphore_put(&m_exitSem);
+    m_selfExitPtr = nullptr;
 }
 
 #if defined(DMQ_DATABUS_TOOLS)

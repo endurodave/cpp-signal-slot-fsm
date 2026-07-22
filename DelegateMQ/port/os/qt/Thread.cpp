@@ -35,6 +35,18 @@ void Worker::OnDispatch(std::shared_ptr<dmq::DelegateMsg> msg) {
                 bool success = invoker->Invoke(msg);
                 ASSERT_TRUE(success);
             }
+            catch (const std::bad_alloc& e) {
+                qWarning() << "[Thread:" << m_thread->objectName() << "] Unhandled bad_alloc in delegate callback:" << e.what();
+                ASSERT();
+            }
+            catch (const std::invalid_argument& e) {
+                qWarning() << "[Thread:" << m_thread->objectName() << "] Unhandled invalid_argument in delegate callback:" << e.what();
+                ASSERT();
+            }
+            catch (const std::runtime_error& e) {
+                qWarning() << "[Thread:" << m_thread->objectName() << "] Unhandled runtime_error in delegate callback:" << e.what();
+                ASSERT();
+            }
             catch (const std::exception& e) {
                 qWarning() << "[Thread:" << m_thread->objectName() << "] Unhandled exception in delegate callback:" << e.what();
                 ASSERT();
@@ -187,21 +199,13 @@ void Thread::ThreadCheck()
 //----------------------------------------------------------------------------
 void Thread::WatchdogCheckAll()
 {
-    Thread* snapshot[dmq::MAX_WATCHDOG_THREADS];
-    int count = 0;
-
+    const std::lock_guard<dmq::RecursiveMutex> lock(GetWatchdogLock());
+    Thread* p = GetWatchdogHead();
+    while (p != nullptr)
     {
-        const std::lock_guard<dmq::RecursiveMutex> lock(GetWatchdogLock());
-        Thread* p = GetWatchdogHead();
-        while (p != nullptr && count < static_cast<int>(dmq::MAX_WATCHDOG_THREADS))
-        {
-            snapshot[count++] = p;
-            p = p->m_watchdogNext;
-        }
+        p->WatchdogCheck();
+        p = p->m_watchdogNext;
     }
-
-    for (int i = 0; i < count; i++)
-        snapshot[i]->WatchdogCheck();
 }
 
 //----------------------------------------------------------------------------
@@ -236,14 +240,19 @@ void Thread::ExitThread()
         m_cvNotFull.wakeAll();
         m_mutex.unlock();
 
-        m_thread->wait();
+        if (QThread::currentThread() != m_thread) {
+            m_thread->wait();
+            delete m_thread;
+        } else {
+            m_thread->deleteLater();
+        }
 
         // Worker thread has fully stopped; null the back-pointer so the Worker
         // cannot access this Thread if it is kept alive by deleteLater.
-        m_worker->ClearThread();
+        if (m_worker) {
+            m_worker->ClearThread();
+        }
 
-        // Cleanup manually if not using deleteLater
-        delete m_thread;
         m_thread = nullptr;
         m_worker = nullptr;
     }

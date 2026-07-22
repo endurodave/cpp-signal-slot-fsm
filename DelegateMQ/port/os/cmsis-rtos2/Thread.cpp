@@ -159,22 +159,30 @@ void Thread::ExitThread()
     {
         m_exit.store(true);
 
-        // Send exit message
-        ThreadMsg* msg = new (std::nothrow) ThreadMsg(MSG_EXIT_THREAD);
-        if (msg)
-        {
-            // Send pointer, wait forever to ensure it gets in.
-            if (osMessageQueuePut(m_msgq, &msg, 0, osWaitForever) != osOK) 
+        // Check self-exit BEFORE attempting to enqueue the exit message. If
+        // this thread is destroying itself from within its own dispatched
+        // callback, it is not consuming its own queue right now -- it is
+        // blocked here, inside ExitThread(). A blocking osMessageQueuePut()
+        // would deadlock forever if the queue happened to be full. No message
+        // needs to be queued in that case: Run()'s dispatch loop already
+        // checks m_selfExitPtr immediately after the current callback invoke
+        // returns, and unwinds without touching 'this' again.
+        if (osThreadGetId() == m_thread) {
+            if (m_selfExitPtr) *m_selfExitPtr = true;
+        } else {
+            // Send exit message
+            ThreadMsg* msg = new (std::nothrow) ThreadMsg(MSG_EXIT_THREAD);
+            if (msg)
             {
-                delete msg; // Failed to send
+                // Send pointer, wait forever to ensure it gets in.
+                if (osMessageQueuePut(m_msgq, &msg, 0, osWaitForever) != osOK)
+                {
+                    delete msg; // Failed to send
+                }
             }
-        }
 
-        // Wait for thread to process the exit message and signal completion.
-        // We only wait if we are NOT the thread itself (prevent deadlock).
-        // If osThreadGetId() returns NULL or error, we skip wait.
-        if (osThreadGetId() != m_thread && m_exitSem != NULL) {
-            osSemaphoreAcquire(m_exitSem, osWaitForever);
+            // Wait for thread to process the exit message and signal completion.
+            if (m_exitSem != NULL) osSemaphoreAcquire(m_exitSem, osWaitForever);
         }
 
         // Thread has finished Run(). Now we can safely clean up resources.
@@ -241,7 +249,9 @@ bool Thread::DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg)
     // 1. Allocate message container
     ThreadMsg* threadMsg = new (std::nothrow) ThreadMsg(MSG_DISPATCH_DELEGATE, msg);
     if (!threadMsg) return false;
+#if defined(DMQ_DATABUS_TOOLS)
     threadMsg->SetEnqueueTime(Timer::GetNow());
+#endif
 
     // 2. Send pointer to queue
     uint32_t timeout;
@@ -326,21 +336,13 @@ void Thread::ThreadCheck()
 //----------------------------------------------------------------------------
 void Thread::WatchdogCheckAll()
 {
-    Thread* snapshot[dmq::MAX_WATCHDOG_THREADS];
-    int count = 0;
-
+    const std::lock_guard<dmq::RecursiveMutex> lock(GetWatchdogLock());
+    Thread* p = GetWatchdogHead();
+    while (p != nullptr)
     {
-        const std::lock_guard<dmq::RecursiveMutex> lock(GetWatchdogLock());
-        Thread* p = GetWatchdogHead();
-        while (p != nullptr && count < static_cast<int>(dmq::MAX_WATCHDOG_THREADS))
-        {
-            snapshot[count++] = p;
-            p = p->m_watchdogNext;
-        }
+        p->WatchdogCheck();
+        p = p->m_watchdogNext;
     }
-
-    for (int i = 0; i < count; i++)
-        snapshot[i]->WatchdogCheck();
 }
 
 //----------------------------------------------------------------------------
@@ -363,9 +365,12 @@ dmq::RecursiveMutex& Thread::GetWatchdogLock()
 
 void Thread::Run()
 {
+    bool selfExit = false;
+    m_selfExitPtr = &selfExit;
+
     ThreadMsg* msg = nullptr;
 
-    while (!m_exit.load())
+    while (!selfExit && !m_exit.load())
     {
         dmq::Duration watchdogTimeout;
         {
@@ -420,6 +425,18 @@ void Thread::Run()
                     success = invoker->Invoke(delegateMsg);
                     ASSERT_TRUE(success);
                 }
+                catch (const std::bad_alloc& e) {
+                    std::cerr << "[Thread:" << THREAD_NAME << "] Unhandled bad_alloc in delegate callback: " << e.what() << std::endl;
+                    ASSERT();
+                }
+                catch (const std::invalid_argument& e) {
+                    std::cerr << "[Thread:" << THREAD_NAME << "] Unhandled invalid_argument in delegate callback: " << e.what() << std::endl;
+                    ASSERT();
+                }
+                catch (const std::runtime_error& e) {
+                    std::cerr << "[Thread:" << THREAD_NAME << "] Unhandled runtime_error in delegate callback: " << e.what() << std::endl;
+                    ASSERT();
+                }
                 catch (const std::exception& e) {
                     printf("[Thread:%s] Unhandled exception in delegate callback: %s\n", THREAD_NAME.c_str(), e.what());
                     ASSERT();
@@ -430,8 +447,14 @@ void Thread::Run()
                 }
 #else
                 bool success = invoker->Invoke(delegateMsg);
-                ASSERT_TRUE(success);
+                if (!selfExit) ASSERT_TRUE(success);
 #endif
+                if (selfExit) {
+                    delete msg;
+                    m_selfExitPtr = nullptr;
+                    return;
+                }
+
 #if defined(DMQ_DATABUS_TOOLS)
                 dmq::Duration invokeTime = Timer::GetNow() - start;
                 {
@@ -457,6 +480,7 @@ void Thread::Run()
     if (m_exitSem) {
         osSemaphoreRelease(m_exitSem);
     }
+    m_selfExitPtr = nullptr;
 }
 
 #if defined(DMQ_DATABUS_TOOLS)
