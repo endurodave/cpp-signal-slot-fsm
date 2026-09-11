@@ -1,10 +1,10 @@
 #ifndef DMQ_THREAD_CMSIS_RTOS2
-#error "port/os/cmsis-rtos2/Thread.cpp requires DMQ_THREAD_CMSIS_RTOS2. Remove this file from your build configuration or define DMQ_THREAD_CMSIS_RTOS2."
+#error "port/os/cmsis-rtos2/CmsisRtos2Thread.cpp requires DMQ_THREAD_CMSIS_RTOS2. Remove this file from your build configuration or define DMQ_THREAD_CMSIS_RTOS2."
 #endif
 
 #include "DelegateMQ.h"
-#include "Thread.h"
-#include "ThreadMsg.h"
+#include "CmsisRtos2Thread.h"
+#include "port/os/common/ThreadMsg.h"
 #include "extras/util/Fault.h"
 #include <cstdio>
 #include <new>
@@ -22,7 +22,7 @@ using namespace dmq::util;
 //----------------------------------------------------------------------------
 // Thread Constructor
 //----------------------------------------------------------------------------
-Thread::Thread(const char* threadName, size_t maxQueueSize, FullPolicy fullPolicy, dmq::Duration dispatchTimeout, const char* cpuName)
+CmsisRtos2Thread::CmsisRtos2Thread(const char* threadName, size_t maxQueueSize, FullPolicy fullPolicy, dmq::Duration dispatchTimeout, const char* cpuName)
     : THREAD_NAME(threadName)
     , CPU_NAME(cpuName)
     , m_queueSize((maxQueueSize == 0) ? DEFAULT_QUEUE_SIZE : maxQueueSize)
@@ -41,12 +41,12 @@ Thread::Thread(const char* threadName, size_t maxQueueSize, FullPolicy fullPolic
 //----------------------------------------------------------------------------
 // Thread Destructor
 //----------------------------------------------------------------------------
-Thread::~Thread()
+CmsisRtos2Thread::~CmsisRtos2Thread()
 {
     ExitThread();
 
     const std::lock_guard<dmq::RecursiveMutex> lock(GetWatchdogLock());
-    Thread** pp = &GetWatchdogHead();
+    CmsisRtos2Thread** pp = &GetWatchdogHead();
     while (*pp != nullptr)
     {
         if (*pp == this)
@@ -75,7 +75,7 @@ Thread::~Thread()
 //----------------------------------------------------------------------------
 // CreateThread
 //----------------------------------------------------------------------------
-bool Thread::CreateThread(std::optional<dmq::Duration> watchdogTimeout)
+bool CmsisRtos2Thread::CreateThread(std::optional<dmq::Duration> watchdogTimeout)
 {
     if (m_thread == NULL)
     {
@@ -85,9 +85,7 @@ bool Thread::CreateThread(std::optional<dmq::Duration> watchdogTimeout)
         ASSERT_TRUE(m_exitSem != NULL);
 
         // 2. Create Message Queue
-        // We store pointers (ThreadMsg*), so msg_size = sizeof(ThreadMsg*)
-        m_msgq = osMessageQueueNew(m_queueSize, sizeof(ThreadMsg*), NULL);
-        ASSERT_TRUE(m_msgq != NULL);
+        ASSERT_TRUE(m_queue.Create(m_queueSize));
 
         // 3. Create Thread
         osThreadAttr_t attr = {0};
@@ -95,7 +93,7 @@ bool Thread::CreateThread(std::optional<dmq::Duration> watchdogTimeout)
         attr.stack_size = STACK_SIZE;
         attr.priority = m_priority;
 
-        m_thread = osThreadNew(Thread::Process, this, &attr);
+        m_thread = osThreadNew(CmsisRtos2Thread::Process, this, &attr);
         ASSERT_TRUE(m_thread != NULL);
 
         m_lastAliveTime.store(Timer::GetNow());
@@ -108,7 +106,7 @@ bool Thread::CreateThread(std::optional<dmq::Duration> watchdogTimeout)
 
             // Add to watchdog registry if not already present
             bool found = false;
-            Thread* p = GetWatchdogHead();
+            CmsisRtos2Thread* p = GetWatchdogHead();
             while (p != nullptr)
             {
                 if (p == this)
@@ -132,7 +130,7 @@ bool Thread::CreateThread(std::optional<dmq::Duration> watchdogTimeout)
 //----------------------------------------------------------------------------
 // SetThreadPriority
 //----------------------------------------------------------------------------
-void Thread::SetThreadPriority(osPriority_t priority)
+void CmsisRtos2Thread::SetThreadPriority(osPriority_t priority)
 {
     m_priority = priority;
 
@@ -145,7 +143,7 @@ void Thread::SetThreadPriority(osPriority_t priority)
 //----------------------------------------------------------------------------
 // GetThreadPriority
 //----------------------------------------------------------------------------
-osPriority_t Thread::GetThreadPriority()
+osPriority_t CmsisRtos2Thread::GetThreadPriority()
 {
     return m_priority;
 }
@@ -153,9 +151,9 @@ osPriority_t Thread::GetThreadPriority()
 //----------------------------------------------------------------------------
 // ExitThread
 //----------------------------------------------------------------------------
-void Thread::ExitThread()
+void CmsisRtos2Thread::ExitThread()
 {
-    if (m_msgq != NULL)
+    if (m_queue.IsCreated())
     {
         m_exit.store(true);
 
@@ -175,7 +173,7 @@ void Thread::ExitThread()
             if (msg)
             {
                 // Send pointer, wait forever to ensure it gets in.
-                if (osMessageQueuePut(m_msgq, &msg, 0, osWaitForever) != osOK)
+                if (!m_queue.Send(msg, /*highPriority=*/false, osWaitForever))
                 {
                     delete msg; // Failed to send
                 }
@@ -188,21 +186,15 @@ void Thread::ExitThread()
         // Thread has finished Run(). Now we can safely clean up resources.
         m_thread = NULL;
 
-        if (m_msgq) {
-            ThreadMsg* drainMsg = nullptr;
-            while (osMessageQueueGet(m_msgq, &drainMsg, NULL, 0) == osOK) {
-                delete drainMsg;
-            }
-            osMessageQueueDelete(m_msgq);
-            m_msgq = NULL;
-        }
+        m_queue.DrainAndDelete();
+        m_queue.Destroy();
     }
 }
 
 //----------------------------------------------------------------------------
 // GetThreadId
 //----------------------------------------------------------------------------
-osThreadId_t Thread::GetThreadId()
+osThreadId_t CmsisRtos2Thread::GetThreadId()
 {
     return m_thread;
 }
@@ -210,7 +202,7 @@ osThreadId_t Thread::GetThreadId()
 //----------------------------------------------------------------------------
 // GetCurrentThreadId
 //----------------------------------------------------------------------------
-osThreadId_t Thread::GetCurrentThreadId()
+osThreadId_t CmsisRtos2Thread::GetCurrentThreadId()
 {
     return osThreadGetId();
 }
@@ -218,7 +210,7 @@ osThreadId_t Thread::GetCurrentThreadId()
 //----------------------------------------------------------------------------
 // IsCurrentThread
 //----------------------------------------------------------------------------
-bool Thread::IsCurrentThread()
+bool CmsisRtos2Thread::IsCurrentThread()
 {
     return GetThreadId() == GetCurrentThreadId();
 }
@@ -226,25 +218,21 @@ bool Thread::IsCurrentThread()
 //----------------------------------------------------------------------------
 // GetQueueSize
 //----------------------------------------------------------------------------
-size_t Thread::GetQueueSize()
+size_t CmsisRtos2Thread::GetQueueSize()
 {
-    if (m_msgq != NULL) {
-        return (size_t)osMessageQueueGetCount(m_msgq);
-    }
-    return 0;
+    return m_queue.Size();
 }
 
-void Thread::Sleep(dmq::Duration timeout) {
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(timeout).count();
-    osDelay(static_cast<uint32_t>(ms));
+void CmsisRtos2Thread::Sleep(dmq::Duration timeout) {
+    dmq::ThisThread::sleep_for(timeout);
 }
 
 //----------------------------------------------------------------------------
 // DispatchDelegate
 //----------------------------------------------------------------------------
-bool Thread::DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg)
+bool CmsisRtos2Thread::DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg)
 {
-    ASSERT_TRUE(m_msgq != NULL);
+    ASSERT_TRUE(m_queue.IsCreated());
 
     // 1. Allocate message container
     ThreadMsg* threadMsg = new (std::nothrow) ThreadMsg(MSG_DISPATCH_DELEGATE, msg);
@@ -260,15 +248,13 @@ bool Thread::DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg)
     else
         timeout = 0;  // DROP and FAULT: non-blocking
 
-    // Option #2: Implement High priority using msg_prio.
-    uint8_t msg_prio = (msg->GetPriority() == Priority::HIGH) ? 1 : 0;
-
-    osStatus_t ret = osMessageQueuePut(m_msgq, &threadMsg, msg_prio, timeout);
-    if (ret != osOK)
+    // High priority uses osMessageQueuePut's native msg_prio argument.
+    bool sent = m_queue.Send(threadMsg, msg->GetPriority() == Priority::HIGH, timeout);
+    if (!sent)
     {
         if (FULL_POLICY == FullPolicy::FAULT) {
             printf("[Thread] CRITICAL: Queue full on thread '%s'! TRIGGERING FAULT.\n", THREAD_NAME.c_str());
-            ASSERT_TRUE(ret == osOK);
+            ASSERT_TRUE(sent);
         } else if (FULL_POLICY == FullPolicy::TIMEOUT) {
             printf("[Thread] WARNING: Queue post timed out on '%s' — possible deadlock. Message dropped.\n", THREAD_NAME.c_str());
         }
@@ -292,9 +278,9 @@ bool Thread::DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg)
 //----------------------------------------------------------------------------
 // Process (Static Entry Point)
 //----------------------------------------------------------------------------
-void Thread::Process(void* argument)
+void CmsisRtos2Thread::Process(void* argument)
 {
-    Thread* thread = static_cast<Thread*>(argument);
+    CmsisRtos2Thread* thread = static_cast<CmsisRtos2Thread*>(argument);
     if (thread)
     {
         thread->Run();
@@ -307,7 +293,7 @@ void Thread::Process(void* argument)
 //----------------------------------------------------------------------------
 // WatchdogCheck
 //----------------------------------------------------------------------------
-void Thread::WatchdogCheck()
+void CmsisRtos2Thread::WatchdogCheck()
 {
     auto now = Timer::GetNow();
     auto lastAlive = m_lastAliveTime.load();
@@ -326,7 +312,7 @@ void Thread::WatchdogCheck()
 //----------------------------------------------------------------------------
 // ThreadCheck
 //----------------------------------------------------------------------------
-void Thread::ThreadCheck()
+void CmsisRtos2Thread::ThreadCheck()
 {
     m_lastAliveTime.store(Timer::GetNow());
 }
@@ -334,10 +320,10 @@ void Thread::ThreadCheck()
 //----------------------------------------------------------------------------
 // WatchdogCheckAll
 //----------------------------------------------------------------------------
-void Thread::WatchdogCheckAll()
+void CmsisRtos2Thread::WatchdogCheckAll()
 {
     const std::lock_guard<dmq::RecursiveMutex> lock(GetWatchdogLock());
-    Thread* p = GetWatchdogHead();
+    CmsisRtos2Thread* p = GetWatchdogHead();
     while (p != nullptr)
     {
         p->WatchdogCheck();
@@ -348,22 +334,22 @@ void Thread::WatchdogCheckAll()
 //----------------------------------------------------------------------------
 // GetWatchdogHead
 //----------------------------------------------------------------------------
-Thread*& Thread::GetWatchdogHead()
+CmsisRtos2Thread*& CmsisRtos2Thread::GetWatchdogHead()
 {
-    static Thread* head = nullptr;
+    static CmsisRtos2Thread* head = nullptr;
     return head;
 }
 
 //----------------------------------------------------------------------------
 // GetWatchdogLock
 //----------------------------------------------------------------------------
-dmq::RecursiveMutex& Thread::GetWatchdogLock()
+dmq::RecursiveMutex& CmsisRtos2Thread::GetWatchdogLock()
 {
     static dmq::RecursiveMutex* lock = new dmq::RecursiveMutex();
     return *lock;
 }
 
-void Thread::Run()
+void CmsisRtos2Thread::Run()
 {
     bool selfExit = false;
     m_selfExitPtr = &selfExit;
@@ -389,11 +375,9 @@ void Thread::Run()
         }
 
         // Block for a message or timeout
-        // msg is a pointer to ThreadMsg*. The queue holds the pointer.
-        if (osMessageQueueGet(m_msgq, &msg, NULL, waitOption) == osOK)
+        msg = m_queue.Receive(waitOption);
+        if (msg != nullptr)
         {
-            if (!msg) continue;
-
             int msgId = msg->GetId();
             if (msgId == MSG_DISPATCH_DELEGATE)
             {
@@ -487,7 +471,7 @@ void Thread::Run()
 //----------------------------------------------------------------------------
 // SnapshotStats
 //----------------------------------------------------------------------------
-Thread::ThreadStats Thread::SnapshotStats()
+CmsisRtos2Thread::ThreadStats CmsisRtos2Thread::SnapshotStats()
 {
     osMutexAcquire(m_statMutex, osWaitForever);
     ThreadStats stats;

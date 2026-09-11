@@ -115,32 +115,37 @@
 // 4. Asynchronous "Blocking" Delegates (Wait for Result)
 // -----------------------------------------------------------------------------
 // Depends on Semaphore/Mutex and C++17 (std::any, std::optional).
-// Valid for StdLib/Win32 (Windows/Linux), Qt, ThreadX, and FreeRTOS (if C++17 enabled).
-#if defined(DMQ_THREAD_STDLIB) || defined(DMQ_THREAD_WIN32) || defined(DMQ_THREAD_QT) || defined(DMQ_THREAD_FREERTOS) || defined(DMQ_THREAD_THREADX)
+// Valid for StdLib/Win32 (Windows/Linux), Qt, ThreadX, FreeRTOS (if C++17
+// enabled), Zephyr, and CMSIS-RTOS2 -- the latter two via their native
+// k_sem/osSemaphore-backed dmq::Semaphore, not the generic condvar+mutex
+// implementation. DMQ_HAS_SEMAPHORE (DelegateOpt.h) is defined for exactly
+// this set of ports, so it's used directly here instead of hand-copying the
+// port list again.
+#if defined(DMQ_HAS_SEMAPHORE)
     #include "delegate/DelegateAsyncWait.h"
 #endif
 
 #if defined(DMQ_THREAD_STDLIB)
-    #include "port/os/stdlib/Thread.h"
-    #include "port/os/stdlib/ThreadMsg.h"
+    #include "port/os/stdlib/StdlibThread.h"
+    #include "port/os/common/ThreadMsg.h"
 #elif defined(DMQ_THREAD_WIN32)
-    #include "port/os/win32/Thread.h"
-    #include "port/os/win32/ThreadMsg.h"
+    #include "port/os/win32/Win32Thread.h"
+    #include "port/os/common/ThreadMsg.h"
 #elif defined(DMQ_THREAD_FREERTOS)
-    #include "port/os/freertos/Thread.h"
-    #include "port/os/freertos/ThreadMsg.h"
+    #include "port/os/freertos/FreeRTOSThread.h"
+    #include "port/os/common/ThreadMsg.h"
 #elif defined(DMQ_THREAD_THREADX)
-    #include "port/os/threadx/Thread.h"
-    #include "port/os/threadx/ThreadMsg.h"
+    #include "port/os/threadx/ThreadXThread.h"
+    #include "port/os/common/ThreadMsg.h"
 #elif defined(DMQ_THREAD_ZEPHYR)
-    #include "port/os/zephyr/Thread.h"
-    #include "port/os/zephyr/ThreadMsg.h"
+    #include "port/os/zephyr/ZephyrThread.h"
+    #include "port/os/common/ThreadMsg.h"
 #elif defined(DMQ_THREAD_CMSIS_RTOS2)
-    #include "port/os/cmsis-rtos2/Thread.h"
-    #include "port/os/cmsis-rtos2/ThreadMsg.h"
+    #include "port/os/cmsis-rtos2/CmsisRtos2Thread.h"
+    #include "port/os/common/ThreadMsg.h"
 #elif defined(DMQ_THREAD_QT)
-    #include "port/os/qt/Thread.h"
-    #include "port/os/qt/ThreadMsg.h"
+    #include "port/os/qt/QtThread.h"
+    #include "port/os/common/ThreadMsg.h"
 #elif defined(DMQ_THREAD_NONE)
     // Bare metal: User must implement their own polling/interrupt logic
 #else
@@ -201,7 +206,7 @@
     #include "port/transport/arm-lwip-netconn-udp/ArmLwipNetconnUdpTransport.h"
 #elif defined(DMQ_TRANSPORT_THREADX_UDP)
     #include "extras/dispatcher/Dispatcher.h"
-    #include "port/transport/threadx-udp/NetXUdpTransport.h"
+    #include "port/transport/netx-udp/NetXUdpTransport.h"
 #elif defined(DMQ_TRANSPORT_STM32_UART)
     #include "extras/dispatcher/Dispatcher.h"
     #include "port/transport/stm32-uart/Stm32UartTransport.h"
@@ -212,7 +217,7 @@
     // No built-in transport. Include the interface and dispatcher so application code
     // can implement a custom ITransport and use RemoteChannel with a mock or stub.
     #include "extras/dispatcher/Dispatcher.h"
-    #include "port/transport/ITransport.h"
+    #include "port/transport/common/ITransport.h"
 #else
     #warning "Transport implementation not found."
 #endif

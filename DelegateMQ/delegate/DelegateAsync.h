@@ -54,6 +54,8 @@
 #include <atomic>
 #include <tuple>
 
+DMQ_OPTIMIZE_ON
+
 namespace dmq {
 
 /// @brief Stores all function arguments suitable for non-blocking asynchronous calls.
@@ -102,6 +104,71 @@ private:
     std::tuple<Args...> m_args;
 };
 
+namespace detail {
+
+/// @brief Non-template holder for a `DelegateXAsync<...>` instance's dispatch state
+/// (destination thread, message priority). None of this depends on the bound function's
+/// signature or target class, so every `DelegateFreeAsync`/`DelegateMemberAsync`/
+/// `DelegateMemberAsyncSp`/`DelegateFunctionAsync` instantiation composes this one
+/// definition instead of each generating its own copy of the same two fields plus their
+/// Assign()/Equal()/move-ctor plumbing.
+/// @note `m_sync` deliberately stays outside this class (declared on each owning class
+/// instead) — it is never copied/assigned/moved between instances, only ever reset to
+/// `false` on a fresh object, which is exactly what leaving it out of Assign()/the copy
+/// ctor already achieved before this refactor. Folding it in here would require a custom
+/// (non-default) copy assignment operator to preserve that; simpler and safer to leave it
+/// where the "never copied" behavior falls out for free.
+class AsyncDispatchState {
+public:
+    IThread* GetThread() const noexcept { return m_thread; }
+    void SetThread(IThread* thread) noexcept { m_thread = thread; }
+    Priority GetPriority() const noexcept { return m_priority; }
+    void SetPriority(Priority priority) noexcept { m_priority = priority; }
+
+    bool Equal(const AsyncDispatchState& rhs) const noexcept {
+        return m_thread == rhs.m_thread && m_priority == rhs.m_priority;
+    }
+
+private:
+    IThread* m_thread = nullptr;
+    Priority m_priority = Priority::NORMAL;
+};
+
+/// @brief Builds the heap-copied argument message and dispatches it to `thread`.
+/// @details Templated only on `Args...`, not on the owning delegate's target-object or
+/// return type, so this single instantiation is shared by every `DelegateXAsync<...>`
+/// signature that takes the same arguments, instead of each owning class generating its
+/// own copy of this logic.
+/// @param[in] invoker The already-cloned delegate to invoke on the destination thread,
+/// type-erased through `IThreadInvoker`.
+/// @param[in] thread The destination thread, or `nullptr` if unbound.
+/// @param[in] priority The message priority.
+/// @param[in] args The function arguments, if any.
+template <class... Args>
+void DispatchAsync(std::shared_ptr<IThreadInvoker> invoker, IThread* thread, Priority priority, Args&&... args) {
+    // Create a new message instance for sending to the destination thread. Erase to
+    // the non-templated DelegateMsg base BEFORE constructing the shared_ptr (rather
+    // than xmake_shared<DelegateAsyncMsg<Args...>>) so the shared_ptr control block
+    // is not templated on Args... -- one control-block type is then shared across
+    // every DelegateAsync signature instead of duplicated per signature.
+    auto* rawMsg = new(std::nothrow) DelegateAsyncMsg<Args...>(std::move(invoker), priority, std::forward<Args>(args)...);
+    if (!rawMsg)
+        BAD_ALLOC();
+    DelegateMsg* msgBase = rawMsg;
+    std::shared_ptr<DelegateMsg> msg(msgBase, std::default_delete<DelegateMsg>(), dmq::stl_allocator<DelegateMsg>());
+
+    if (thread) {
+        // Dispatch message onto the callback destination thread. Invoke()
+        // will be called by the destintation thread.
+        bool success = thread->DispatchDelegate(msg);
+        if (!success) {
+            LOG_ERROR("DelegateAsync dispatch failed");
+        }
+    }
+}
+
+} // namespace detail
+
 template <class R>
 class DelegateFreeAsync; // Not defined
 
@@ -122,7 +189,7 @@ public:
     /// @param[in] func The target free function to store.
     /// @param[in] thread The execution thread to invoke `func`.
     DelegateFreeAsync(FreeFunc func, IThread& thread) :
-        BaseType(func), m_thread(&thread) {
+        BaseType(func) {
         Bind(func, thread);
     }
 
@@ -139,7 +206,7 @@ public:
     /// @brief Move constructor that transfers ownership of resources.
     /// @param[in] rhs The object to move from.
     DelegateFreeAsync(ClassType&& rhs) noexcept :
-        BaseType(std::move(rhs)), m_thread(rhs.m_thread), m_priority(rhs.m_priority) {
+        BaseType(std::move(rhs)), m_state(rhs.m_state) {
         rhs.Clear();
     }
 
@@ -152,7 +219,7 @@ public:
     /// match the signature of the delegate.
     /// @param[in] thread The execution thread to invoke `func`.
     void Bind(FreeFunc func, IThread& thread) {
-        m_thread = &thread;
+        m_state.SetThread(&thread);
         BaseType::Bind(func);
     }
 
@@ -163,8 +230,7 @@ public:
     /// current object.
     /// @param[in] rhs The object whose state is to be copied.
     void Assign(const ClassType& rhs) {
-        m_thread = rhs.m_thread;
-        m_priority = rhs.m_priority;
+        m_state = rhs.m_state;
         BaseType::Assign(rhs);
     }
     /// @brief Creates a copy of the current object.
@@ -194,8 +260,7 @@ public:
     ClassType& operator=(ClassType&& rhs) noexcept {
         if (&rhs != this) {
             BaseType::operator=(std::move(rhs));
-            m_thread = rhs.m_thread;    // Use the resource
-            m_priority = rhs.m_priority;
+            m_state = rhs.m_state;    // Use the resource
             rhs.Clear();
         }
         return *this;
@@ -212,8 +277,7 @@ public:
     virtual bool Equal(const DelegateBase& rhs) const override {
         auto derivedRhs = dynamic_cast<const ClassType*>(&rhs);
         return derivedRhs &&
-            m_thread == derivedRhs->m_thread &&
-            m_priority == derivedRhs->m_priority &&
+            m_state.Equal(derivedRhs->m_state) &&
             BaseType::Equal(rhs);
     }
 
@@ -270,30 +334,21 @@ public:
             return BaseType::operator()(std::forward<Args>(args)...);
         }
         else {
-            // Create a clone instance of this delegate 
-            auto delegate = xmake_shared<ClassType>(*this);
-            if (!delegate)
+            // Create a clone instance of this delegate. Erase to the non-templated
+            // IThreadInvoker interface BEFORE constructing the shared_ptr (rather than
+            // xmake_shared<ClassType>) so the shared_ptr control block is not templated
+            // on RetType/Args... -- one control-block type is then shared across every
+            // DelegateAsync kind and signature instead of duplicated per signature.
+            ClassType* rawClone = this->Clone();
+            if (!rawClone)
                 BAD_ALLOC();
+            IThreadInvoker* invokerBase = rawClone;
+            std::shared_ptr<IThreadInvoker> delegate(invokerBase, std::default_delete<IThreadInvoker>(), dmq::stl_allocator<IThreadInvoker>());
 
-            // Create a new message instance for sending to the destination thread
-            auto msg = xmake_shared<DelegateAsyncMsg<Args...>>(delegate, m_priority, std::forward<Args>(args)...);
-            if (!msg)
-                BAD_ALLOC();
-
-            auto thread = this->GetThread();
-            if (thread) {
-                // Dispatch message onto the callback destination thread. Invoke()
-                // will be called by the destintation thread. 
-                bool success = thread->DispatchDelegate(msg);
-                if (!success) {
-                    LOG_ERROR("DelegateAsync dispatch failed");
-                }
-            }
+            detail::DispatchAsync(delegate, m_state.GetThread(), m_state.GetPriority(), std::forward<Args>(args)...);
 
             // Do not wait for destination thread return value from async function call
             return RetType();
-
-
         }
     }
 
@@ -329,22 +384,21 @@ public:
 
     /// @brief Get the destination thread that the target function is invoked on.
     /// @return The target thread.
-    IThread* GetThread() const noexcept { return m_thread; }
+    IThread* GetThread() const noexcept { return m_state.GetThread(); }
 
     /// @brief Get the delegate message priority
     /// @return Delegate message priority
-    Priority GetPriority() const noexcept { return m_priority; }
-    void SetPriority(Priority priority) noexcept { m_priority = priority; }
+    Priority GetPriority() const noexcept { return m_state.GetPriority(); }
+    void SetPriority(Priority priority) noexcept { m_state.SetPriority(priority); }
 
 private:
-    /// The target thread to invoke the delegate function.
-    IThread* m_thread = nullptr;
+    /// Destination thread and message priority. Not templated on Sig/TClass — see
+    /// `detail::AsyncDispatchState`.
+    detail::AsyncDispatchState m_state;
 
-    /// Flag to control synchronous vs asynchronous target invoke behavior.
+    /// Flag to control synchronous vs asynchronous target invoke behavior. Deliberately
+    /// kept outside `m_state` — see the note on `detail::AsyncDispatchState`.
     std::atomic<bool> m_sync{false};
-
-    /// The delegate message priority
-    Priority m_priority = Priority::NORMAL;
 
     // </common_code>
 };
@@ -373,7 +427,7 @@ public:
     /// @param[in] object The target object pointer to store.
     /// @param[in] func The target member function to store.
     /// @param[in] thread The execution thread to invoke `func`.
-    DelegateMemberAsync(SharedPtr object, MemberFunc func, IThread& thread) : BaseType(object, func), m_thread(&thread) {
+    DelegateMemberAsync(SharedPtr object, MemberFunc func, IThread& thread) : BaseType(object, func) {
         Bind(object, func, thread);
     }
 
@@ -381,7 +435,7 @@ public:
     /// @param[in] object The target object pointer to store.
     /// @param[in] func The target const member function to store.
     /// @param[in] thread The execution thread to invoke `func`.
-    DelegateMemberAsync(SharedPtr object, ConstMemberFunc func, IThread& thread) : BaseType(object, func), m_thread(&thread) {
+    DelegateMemberAsync(SharedPtr object, ConstMemberFunc func, IThread& thread) : BaseType(object, func) {
         Bind(object, func, thread);
     }
 
@@ -389,7 +443,7 @@ public:
     /// @param[in] object The target object pointer to store.
     /// @param[in] func The target member function to store.
     /// @param[in] thread The execution thread to invoke `func`.
-    DelegateMemberAsync(ObjectPtr object, MemberFunc func, IThread& thread) : BaseType(object, func), m_thread(&thread) {
+    DelegateMemberAsync(ObjectPtr object, MemberFunc func, IThread& thread) : BaseType(object, func) {
         Bind(object, func, thread);
     }
 
@@ -397,7 +451,7 @@ public:
     /// @param[in] object The target object pointer to store.
     /// @param[in] func The target const member function to store.
     /// @param[in] thread The execution thread to invoke `func`.
-    DelegateMemberAsync(ObjectPtr object, ConstMemberFunc func, IThread& thread) : BaseType(object, func), m_thread(&thread) {
+    DelegateMemberAsync(ObjectPtr object, ConstMemberFunc func, IThread& thread) : BaseType(object, func) {
         Bind(object, func, thread);
     }
 
@@ -414,7 +468,7 @@ public:
     /// @brief Move constructor that transfers ownership of resources.
     /// @param[in] rhs The object to move from.
     DelegateMemberAsync(ClassType&& rhs) noexcept :
-        BaseType(std::move(rhs)), m_thread(rhs.m_thread), m_priority(rhs.m_priority) {
+        BaseType(std::move(rhs)), m_state(rhs.m_state) {
         rhs.Clear();
     }
 
@@ -428,7 +482,7 @@ public:
     /// the signature of the delegate.
     /// @param[in] thread The execution thread to invoke `func`.
     void Bind(SharedPtr object, MemberFunc func, IThread& thread) {
-        m_thread = &thread;
+        m_state.SetThread(&thread);
         BaseType::Bind(object, func);
     }
 
@@ -440,7 +494,7 @@ public:
     /// match the signature of the delegate.
     /// @param[in] thread The execution thread to invoke `func`.
     void Bind(SharedPtr object, ConstMemberFunc func, IThread& thread) {
-        m_thread = &thread;
+        m_state.SetThread(&thread);
         BaseType::Bind(object, func);
     }
 
@@ -452,7 +506,7 @@ public:
     /// the signature of the delegate.
     /// @param[in] thread The execution thread to invoke `func`.
     void Bind(ObjectPtr object, MemberFunc func, IThread& thread) {
-        m_thread = &thread;
+        m_state.SetThread(&thread);
         BaseType::Bind(object, func);
     }
 
@@ -464,7 +518,7 @@ public:
     /// match the signature of the delegate.
     /// @param[in] thread The execution thread to invoke `func`.
     void Bind(ObjectPtr object, ConstMemberFunc func, IThread& thread) {
-        m_thread = &thread;
+        m_state.SetThread(&thread);
         BaseType::Bind(object, func);
     }
 
@@ -475,8 +529,7 @@ public:
     /// current object.
     /// @param[in] rhs The object whose state is to be copied.
     void Assign(const ClassType& rhs) {
-        m_thread = rhs.m_thread;
-        m_priority = rhs.m_priority;
+        m_state = rhs.m_state;
         BaseType::Assign(rhs);
     }
     /// @brief Creates a copy of the current object.
@@ -506,8 +559,7 @@ public:
     ClassType& operator=(ClassType&& rhs) noexcept {
         if (&rhs != this) {
             BaseType::operator=(std::move(rhs));
-            m_thread = rhs.m_thread;    // Use the resource
-            m_priority = rhs.m_priority;
+            m_state = rhs.m_state;    // Use the resource
             rhs.Clear();
         }
         return *this;
@@ -524,8 +576,7 @@ public:
     virtual bool Equal(const DelegateBase& rhs) const override {
         auto derivedRhs = dynamic_cast<const ClassType*>(&rhs);
         return derivedRhs &&
-            m_thread == derivedRhs->m_thread &&
-            m_priority == derivedRhs->m_priority &&
+            m_state.Equal(derivedRhs->m_state) &&
             BaseType::Equal(rhs);
     }
 
@@ -582,30 +633,21 @@ public:
             return BaseType::operator()(std::forward<Args>(args)...);
         }
         else {
-            // Create a clone instance of this delegate 
-            auto delegate = xmake_shared<ClassType>(*this);
-            if (!delegate)
+            // Create a clone instance of this delegate. Erase to the non-templated
+            // IThreadInvoker interface BEFORE constructing the shared_ptr (rather than
+            // xmake_shared<ClassType>) so the shared_ptr control block is not templated
+            // on RetType/Args... -- one control-block type is then shared across every
+            // DelegateAsync kind and signature instead of duplicated per signature.
+            ClassType* rawClone = this->Clone();
+            if (!rawClone)
                 BAD_ALLOC();
+            IThreadInvoker* invokerBase = rawClone;
+            std::shared_ptr<IThreadInvoker> delegate(invokerBase, std::default_delete<IThreadInvoker>(), dmq::stl_allocator<IThreadInvoker>());
 
-            // Create a new message instance for sending to the destination thread
-            auto msg = xmake_shared<DelegateAsyncMsg<Args...>>(delegate, m_priority, std::forward<Args>(args)...);
-            if (!msg)
-                BAD_ALLOC();
-
-            auto thread = this->GetThread();
-            if (thread) {
-                // Dispatch message onto the callback destination thread. Invoke()
-                // will be called by the destintation thread. 
-                bool success = thread->DispatchDelegate(msg);
-                if (!success) {
-                    LOG_ERROR("DelegateAsync dispatch failed");
-                }
-            }
+            detail::DispatchAsync(delegate, m_state.GetThread(), m_state.GetPriority(), std::forward<Args>(args)...);
 
             // Do not wait for destination thread return value from async function call
             return RetType();
-
-
         }
     }
 
@@ -641,22 +683,21 @@ public:
 
     /// @brief Get the destination thread that the target function is invoked on.
     /// @return The target thread.
-    IThread* GetThread() const noexcept { return m_thread; }
+    IThread* GetThread() const noexcept { return m_state.GetThread(); }
 
     /// @brief Get the delegate message priority
     /// @return Delegate message priority
-    Priority GetPriority() const noexcept { return m_priority; }
-    void SetPriority(Priority priority) noexcept { m_priority = priority; }
+    Priority GetPriority() const noexcept { return m_state.GetPriority(); }
+    void SetPriority(Priority priority) noexcept { m_state.SetPriority(priority); }
 
 private:
-    /// The target thread to invoke the delegate function.
-    IThread* m_thread = nullptr;
+    /// Destination thread and message priority. Not templated on Sig/TClass — see
+    /// `detail::AsyncDispatchState`.
+    detail::AsyncDispatchState m_state;
 
-    /// Flag to control synchronous vs asynchronous target invoke behavior.
+    /// Flag to control synchronous vs asynchronous target invoke behavior. Deliberately
+    /// kept outside `m_state` — see the note on `detail::AsyncDispatchState`.
     std::atomic<bool> m_sync{false};
-
-    /// The delegate message priority
-    Priority m_priority = Priority::NORMAL;
 
     // </common_code>
 };
@@ -682,30 +723,30 @@ public:
     static_assert(!(std::disjunction_v<trait::is_non_const_shared_ptr_reference<Args>...>),
         "Non-const std::shared_ptr reference/pointer arguments are not allowed");
 
-    DelegateMemberAsyncSp(SharedPtr object, MemberFunc func, IThread& thread) : BaseType(object, func), m_thread(&thread) {
+    DelegateMemberAsyncSp(SharedPtr object, MemberFunc func, IThread& thread) : BaseType(object, func) {
         Bind(object, func, thread);
     }
 
-    DelegateMemberAsyncSp(SharedPtr object, ConstMemberFunc func, IThread& thread) : BaseType(object, func), m_thread(&thread) {
+    DelegateMemberAsyncSp(SharedPtr object, ConstMemberFunc func, IThread& thread) : BaseType(object, func) {
         Bind(object, func, thread);
     }
 
     DelegateMemberAsyncSp(const ClassType& rhs) : BaseType(rhs) { Assign(rhs); }
 
     DelegateMemberAsyncSp(ClassType&& rhs) noexcept :
-        BaseType(std::move(rhs)), m_thread(rhs.m_thread), m_priority(rhs.m_priority) {
+        BaseType(std::move(rhs)), m_state(rhs.m_state) {
         rhs.Clear();
     }
 
     DelegateMemberAsyncSp() = default;
 
     void Bind(SharedPtr object, MemberFunc func, IThread& thread) {
-        m_thread = &thread;
+        m_state.SetThread(&thread);
         BaseType::Bind(object, func);
     }
 
     void Bind(SharedPtr object, ConstMemberFunc func, IThread& thread) {
-        m_thread = &thread;
+        m_state.SetThread(&thread);
         BaseType::Bind(object, func);
     }
 
@@ -716,8 +757,7 @@ public:
     /// current object.
     /// @param[in] rhs The object whose state is to be copied.
     void Assign(const ClassType& rhs) {
-        m_thread = rhs.m_thread;
-        m_priority = rhs.m_priority;
+        m_state = rhs.m_state;
         BaseType::Assign(rhs);
     }
     /// @brief Creates a copy of the current object.
@@ -747,8 +787,7 @@ public:
     ClassType& operator=(ClassType&& rhs) noexcept {
         if (&rhs != this) {
             BaseType::operator=(std::move(rhs));
-            m_thread = rhs.m_thread;    // Use the resource
-            m_priority = rhs.m_priority;
+            m_state = rhs.m_state;    // Use the resource
             rhs.Clear();
         }
         return *this;
@@ -765,8 +804,7 @@ public:
     virtual bool Equal(const DelegateBase& rhs) const override {
         auto derivedRhs = dynamic_cast<const ClassType*>(&rhs);
         return derivedRhs &&
-            m_thread == derivedRhs->m_thread &&
-            m_priority == derivedRhs->m_priority &&
+            m_state.Equal(derivedRhs->m_state) &&
             BaseType::Equal(rhs);
     }
 
@@ -823,30 +861,21 @@ public:
             return BaseType::operator()(std::forward<Args>(args)...);
         }
         else {
-            // Create a clone instance of this delegate 
-            auto delegate = xmake_shared<ClassType>(*this);
-            if (!delegate)
+            // Create a clone instance of this delegate. Erase to the non-templated
+            // IThreadInvoker interface BEFORE constructing the shared_ptr (rather than
+            // xmake_shared<ClassType>) so the shared_ptr control block is not templated
+            // on RetType/Args... -- one control-block type is then shared across every
+            // DelegateAsync kind and signature instead of duplicated per signature.
+            ClassType* rawClone = this->Clone();
+            if (!rawClone)
                 BAD_ALLOC();
+            IThreadInvoker* invokerBase = rawClone;
+            std::shared_ptr<IThreadInvoker> delegate(invokerBase, std::default_delete<IThreadInvoker>(), dmq::stl_allocator<IThreadInvoker>());
 
-            // Create a new message instance for sending to the destination thread
-            auto msg = xmake_shared<DelegateAsyncMsg<Args...>>(delegate, m_priority, std::forward<Args>(args)...);
-            if (!msg)
-                BAD_ALLOC();
-
-            auto thread = this->GetThread();
-            if (thread) {
-                // Dispatch message onto the callback destination thread. Invoke()
-                // will be called by the destintation thread. 
-                bool success = thread->DispatchDelegate(msg);
-                if (!success) {
-                    LOG_ERROR("DelegateAsync dispatch failed");
-                }
-            }
+            detail::DispatchAsync(delegate, m_state.GetThread(), m_state.GetPriority(), std::forward<Args>(args)...);
 
             // Do not wait for destination thread return value from async function call
             return RetType();
-
-
         }
     }
 
@@ -882,22 +911,21 @@ public:
 
     /// @brief Get the destination thread that the target function is invoked on.
     /// @return The target thread.
-    IThread* GetThread() const noexcept { return m_thread; }
+    IThread* GetThread() const noexcept { return m_state.GetThread(); }
 
     /// @brief Get the delegate message priority
     /// @return Delegate message priority
-    Priority GetPriority() const noexcept { return m_priority; }
-    void SetPriority(Priority priority) noexcept { m_priority = priority; }
+    Priority GetPriority() const noexcept { return m_state.GetPriority(); }
+    void SetPriority(Priority priority) noexcept { m_state.SetPriority(priority); }
 
 private:
-    /// The target thread to invoke the delegate function.
-    IThread* m_thread = nullptr;
+    /// Destination thread and message priority. Not templated on Sig/TClass — see
+    /// `detail::AsyncDispatchState`.
+    detail::AsyncDispatchState m_state;
 
-    /// Flag to control synchronous vs asynchronous target invoke behavior.
+    /// Flag to control synchronous vs asynchronous target invoke behavior. Deliberately
+    /// kept outside `m_state` — see the note on `detail::AsyncDispatchState`.
     std::atomic<bool> m_sync{false};
-
-    /// The delegate message priority
-    Priority m_priority = Priority::NORMAL;
 
     // </common_code>
 };
@@ -928,7 +956,7 @@ public:
     /// @param[in] func The target `std::function` to store.
     /// @param[in] thread The execution thread to invoke `func`.
     DelegateFunctionAsync(FunctionType func, IThread& thread) :
-        BaseType(func), m_thread(&thread) {
+        BaseType(func) {
         Bind(func, thread);
     }
 
@@ -945,7 +973,7 @@ public:
     /// @brief Move constructor that transfers ownership of resources.
     /// @param[in] rhs The object to move from.
     DelegateFunctionAsync(ClassType&& rhs) noexcept :
-        BaseType(std::move(rhs)), m_thread(rhs.m_thread), m_priority(rhs.m_priority) {
+        BaseType(std::move(rhs)), m_state(rhs.m_state) {
         rhs.Clear();
     }
 
@@ -958,7 +986,7 @@ public:
     /// the signature of the delegate.
     /// @param[in] thread The execution thread to invoke `func`.
     void Bind(FunctionType func, IThread& thread) {
-        m_thread = &thread;
+        m_state.SetThread(&thread);
         BaseType::Bind(func);
     }
 
@@ -969,8 +997,7 @@ public:
     /// current object.
     /// @param[in] rhs The object whose state is to be copied.
     void Assign(const ClassType& rhs) {
-        m_thread = rhs.m_thread;
-        m_priority = rhs.m_priority;
+        m_state = rhs.m_state;
         BaseType::Assign(rhs);
     }
     /// @brief Creates a copy of the current object.
@@ -1000,8 +1027,7 @@ public:
     ClassType& operator=(ClassType&& rhs) noexcept {
         if (&rhs != this) {
             BaseType::operator=(std::move(rhs));
-            m_thread = rhs.m_thread;    // Use the resource
-            m_priority = rhs.m_priority;
+            m_state = rhs.m_state;    // Use the resource
             rhs.Clear();
         }
         return *this;
@@ -1018,8 +1044,7 @@ public:
     virtual bool Equal(const DelegateBase& rhs) const override {
         auto derivedRhs = dynamic_cast<const ClassType*>(&rhs);
         return derivedRhs &&
-            m_thread == derivedRhs->m_thread &&
-            m_priority == derivedRhs->m_priority &&
+            m_state.Equal(derivedRhs->m_state) &&
             BaseType::Equal(rhs);
     }
 
@@ -1076,30 +1101,21 @@ public:
             return BaseType::operator()(std::forward<Args>(args)...);
         }
         else {
-            // Create a clone instance of this delegate 
-            auto delegate = xmake_shared<ClassType>(*this);
-            if (!delegate)
+            // Create a clone instance of this delegate. Erase to the non-templated
+            // IThreadInvoker interface BEFORE constructing the shared_ptr (rather than
+            // xmake_shared<ClassType>) so the shared_ptr control block is not templated
+            // on RetType/Args... -- one control-block type is then shared across every
+            // DelegateAsync kind and signature instead of duplicated per signature.
+            ClassType* rawClone = this->Clone();
+            if (!rawClone)
                 BAD_ALLOC();
+            IThreadInvoker* invokerBase = rawClone;
+            std::shared_ptr<IThreadInvoker> delegate(invokerBase, std::default_delete<IThreadInvoker>(), dmq::stl_allocator<IThreadInvoker>());
 
-            // Create a new message instance for sending to the destination thread
-            auto msg = xmake_shared<DelegateAsyncMsg<Args...>>(delegate, m_priority, std::forward<Args>(args)...);
-            if (!msg)
-                BAD_ALLOC();
-
-            auto thread = this->GetThread();
-            if (thread) {
-                // Dispatch message onto the callback destination thread. Invoke()
-                // will be called by the destintation thread. 
-                bool success = thread->DispatchDelegate(msg);
-                if (!success) {
-                    LOG_ERROR("DelegateAsync dispatch failed");
-                }
-            }
+            detail::DispatchAsync(delegate, m_state.GetThread(), m_state.GetPriority(), std::forward<Args>(args)...);
 
             // Do not wait for destination thread return value from async function call
             return RetType();
-
-
         }
     }
 
@@ -1135,22 +1151,21 @@ public:
 
     /// @brief Get the destination thread that the target function is invoked on.
     /// @return The target thread.
-    IThread* GetThread() const noexcept { return m_thread; }
+    IThread* GetThread() const noexcept { return m_state.GetThread(); }
 
     /// @brief Get the delegate message priority
     /// @return Delegate message priority
-    Priority GetPriority() const noexcept { return m_priority; }
-    void SetPriority(Priority priority) noexcept { m_priority = priority; }
+    Priority GetPriority() const noexcept { return m_state.GetPriority(); }
+    void SetPriority(Priority priority) noexcept { m_state.SetPriority(priority); }
 
 private:
-    /// The target thread to invoke the delegate function.
-    IThread* m_thread = nullptr;
+    /// Destination thread and message priority. Not templated on Sig/TClass — see
+    /// `detail::AsyncDispatchState`.
+    detail::AsyncDispatchState m_state;
 
-    /// Flag to control synchronous vs asynchronous target invoke behavior.
+    /// Flag to control synchronous vs asynchronous target invoke behavior. Deliberately
+    /// kept outside `m_state` — see the note on `detail::AsyncDispatchState`.
     std::atomic<bool> m_sync{false};
-
-    /// The delegate message priority
-    Priority m_priority = Priority::NORMAL;
 
     // </common_code>
 };
@@ -1255,5 +1270,7 @@ auto MakeDelegate(F&& func, IThread& thread) {
 }
 
 }
+
+DMQ_OPTIMIZE_OFF
 
 #endif

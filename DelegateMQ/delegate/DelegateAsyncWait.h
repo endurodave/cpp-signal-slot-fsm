@@ -2,7 +2,7 @@
 #define _DELEGATE_ASYNC_WAIT_H
 
 #include "DelegateOpt.h"
-#ifdef DMQ_HAS_CV
+#ifdef DMQ_HAS_SEMAPHORE
 
 // DelegateAsyncWait.h
 // @see https://github.com/DelegateMQ/DelegateMQ
@@ -65,6 +65,8 @@
 #include <optional>
 #include <any>
 #include <chrono>
+
+DMQ_OPTIMIZE_ON
 
 namespace dmq {
 
@@ -160,6 +162,108 @@ private:
     bool m_invokeSucceeded = false;
 };
 
+namespace detail {
+
+/// @brief Non-template holder for a `DelegateXAsyncWait<...>` instance's dispatch state
+/// (destination thread, message priority, timeout, and the last async call's result).
+/// None of this depends on the bound function's signature or target class, so every
+/// `DelegateFreeAsyncWait`/`DelegateMemberAsyncWait`/`DelegateMemberAsyncWaitSp`/
+/// `DelegateFunctionAsyncWait` instantiation composes this one definition instead of each
+/// generating its own copy of these five fields plus their Assign()/Equal()/move-ctor
+/// plumbing.
+/// @note `m_sync` deliberately stays outside this class (declared on each owning class
+/// instead) — it is never copied/assigned/moved between instances, only ever reset to
+/// `false` on a fresh object, which is exactly what leaving it out of Assign()/the copy
+/// ctor already achieved before this refactor. Folding it in here would require a custom
+/// (non-default) copy assignment operator to preserve that; simpler and safer to leave it
+/// where the "never copied" behavior falls out for free.
+class AsyncWaitDispatchState {
+public:
+    IThread* GetThread() const noexcept { return m_thread; }
+    void SetThread(IThread* thread) noexcept { m_thread = thread; }
+    Priority GetPriority() const noexcept { return m_priority; }
+    void SetPriority(Priority priority) noexcept { m_priority = priority; }
+    Duration GetTimeout() const noexcept { return m_timeout; }
+    void SetTimeout(Duration timeout) noexcept { m_timeout = timeout; }
+
+    bool IsSuccess() const noexcept { return m_success; }
+    std::any& RetVal() noexcept { return m_retVal; }
+
+    /// Reset the result of the last async call, called at the top of every `operator()`.
+    void ResetResult() noexcept { m_retVal.reset(); m_success = false; }
+
+    /// Record the result of a completed async call.
+    void SetResult(bool success, std::any retVal) noexcept { m_success = success; m_retVal = std::move(retVal); }
+
+    bool Equal(const AsyncWaitDispatchState& rhs) const noexcept {
+        return m_thread == rhs.m_thread && m_priority == rhs.m_priority && m_timeout == rhs.m_timeout;
+    }
+
+private:
+    IThread* m_thread = nullptr;
+    Priority m_priority = Priority::NORMAL;
+    Duration m_timeout = WAIT_INFINITE;
+    bool m_success = false;
+    std::any m_retVal;
+};
+
+/// @brief Builds the argument message, dispatches it to `thread`, and waits (up to
+/// `timeout`) for the destination thread to signal completion.
+/// @details Templated only on `Args...`, not on the owning delegate's target-object or
+/// return type, so this single instantiation is shared by every `DelegateXAsyncWait<...>`
+/// signature that takes the same arguments, instead of each owning class generating its
+/// own copy of this logic.
+/// @param[in] invoker The already-cloned delegate to invoke on the destination thread,
+/// type-erased through `IThreadInvoker`.
+/// @param[in] thread The destination thread, or `nullptr` if unbound.
+/// @param[in] priority The message priority.
+/// @param[in] timeout How long to wait for the destination thread to invoke the function.
+/// @param[in] args The function arguments, if any.
+/// @return `true` if the destination thread invoked the target function within `timeout`
+/// and the invoke completed without an exception propagating out of it; `false` otherwise.
+/// The caller is responsible for pulling the return value off its own cloned delegate
+/// (written there by `Invoke()` on the destination thread) when this returns `true`.
+template <class... Args>
+bool DispatchAsyncWait(std::shared_ptr<IThreadInvoker> invoker, IThread* thread, Priority priority,
+    Duration timeout, Args&&... args) {
+    // Create a new message instance for sending to the destination thread. Erase to
+    // the non-templated DelegateMsg base BEFORE constructing the shared_ptr (rather
+    // than xmake_shared<DelegateAsyncWaitMsg<Args...>>) so the shared_ptr control
+    // block is not templated on Args... -- one control-block type is then shared
+    // across every DelegateAsyncWait signature instead of duplicated per signature.
+    // `rawMsg` stays valid for the whole function (kept alive by `msg`) and is used
+    // for every access specific to the concrete DelegateAsyncWaitMsg<Args...> type;
+    // `msg` itself is only needed, as the erased base, for DispatchDelegate().
+    auto* rawMsg = new(std::nothrow) DelegateAsyncWaitMsg<Args...>(std::move(invoker), priority, std::forward<Args>(args)...);
+    if (!rawMsg)
+        BAD_ALLOC();
+    DelegateMsg* msgBase = rawMsg;
+    std::shared_ptr<DelegateMsg> msg(msgBase, std::default_delete<DelegateMsg>(), dmq::stl_allocator<DelegateMsg>());
+    rawMsg->SetInvokerWaiting(true);
+
+    bool waited = false;
+    if (thread) {
+        // Dispatch message onto the callback destination thread. Invoke()
+        // will be called by the destination thread.
+        if (thread->DispatchDelegate(msg)) {
+            // Wait for destination thread to execute the delegate function and get return value
+            waited = rawMsg->GetSema().Wait(timeout);
+        }
+    }
+
+    // Single lock: read return value and clear InvokerWaiting atomically
+    const dmq::LockGuard<Mutex> lock(rawMsg->GetLock());
+    // Only report success if the target function invoke actually completed;
+    // the semaphore is signaled even when the target function threw, so
+    // `waited` alone is not sufficient to know the call succeeded.
+    bool success = waited && rawMsg->GetInvokeSucceeded();
+    // Set flag that source is not waiting anymore
+    rawMsg->SetInvokerWaiting(false);
+    return success;
+}
+
+} // namespace detail
+
 template <class R>
 class DelegateFreeAsyncWait; // Not defined
 
@@ -182,7 +286,7 @@ public:
     /// @param[in] timeout The calling thread timeout for destination thread to
     /// invoke the target function. 
     DelegateFreeAsyncWait(FreeFunc func, IThread& thread, Duration timeout = WAIT_INFINITE) :
-        BaseType(func), m_thread(&thread), m_timeout(timeout) {
+        BaseType(func) {
         Bind(func, thread, timeout);
     }
 
@@ -199,7 +303,7 @@ public:
     /// @brief Move constructor that transfers ownership of resources.
     /// @param[in] rhs The object to move from.
     DelegateFreeAsyncWait(ClassType&& rhs) noexcept :
-        BaseType(std::move(rhs)), m_thread(rhs.m_thread), m_priority(rhs.m_priority), m_timeout(rhs.m_timeout), m_success(rhs.m_success), m_retVal(rhs.m_retVal) {
+        BaseType(std::move(rhs)), m_state(rhs.m_state) {
         rhs.Clear();
     }
 
@@ -214,8 +318,8 @@ public:
     /// @param[in] timeout The calling thread timeout for destination thread to
     /// invoke the target function. 
     void Bind(FreeFunc func, IThread& thread, Duration timeout = WAIT_INFINITE) {
-        m_thread = &thread;
-        m_timeout = timeout;
+        m_state.SetThread(&thread);
+        m_state.SetTimeout(timeout);
         BaseType::Bind(func);
     }
 
@@ -226,11 +330,7 @@ public:
     /// current object.
     /// @param[in] rhs The object whose state is to be copied.
     void Assign(const ClassType& rhs) {
-        m_thread = rhs.m_thread;
-        m_priority = rhs.m_priority;
-        m_timeout = rhs.m_timeout;
-        m_success = rhs.m_success;
-        m_retVal = rhs.m_retVal;
+        m_state = rhs.m_state;
         BaseType::Assign(rhs);
     }
 
@@ -261,11 +361,7 @@ public:
     ClassType& operator=(ClassType&& rhs) noexcept {
         if (&rhs != this) {
             BaseType::operator=(std::move(rhs));
-            m_thread = rhs.m_thread;    // Use the resource
-            m_priority = rhs.m_priority;
-            m_timeout = rhs.m_timeout;
-            m_success = rhs.m_success;
-            m_retVal = rhs.m_retVal;
+            m_state = rhs.m_state;    // Use the resource
             rhs.Clear();
         }
         return *this;
@@ -282,9 +378,7 @@ public:
     virtual bool Equal(const DelegateBase& rhs) const override {
         auto derivedRhs = dynamic_cast<const ClassType*>(&rhs);
         return derivedRhs &&
-            m_thread == derivedRhs->m_thread &&
-            m_priority == derivedRhs->m_priority &&
-            m_timeout == derivedRhs->m_timeout &&
+            m_state.Equal(derivedRhs->m_state) &&
             BaseType::Equal(rhs);
     }
 
@@ -338,8 +432,7 @@ public:
     /// @return The bound function return value, if any. Use `IsSuccess()` to determine if 
     /// the return value is valid before use.
     virtual RetType operator()(Args... args) override {
-        m_retVal.reset();
-        m_success = false;
+        m_state.ResetResult();
         if (this->Empty())
             return RetType();
 
@@ -348,44 +441,33 @@ public:
             // Invoke the target function directly
             return BaseType::operator()(std::forward<Args>(args)...);
         } else {
-            // Create a clone instance of this delegate 
-            auto delegate = xmake_shared<ClassType>(*this);
-            if (!delegate)
+            // Create a clone instance of this delegate. Erase to the non-templated
+            // IThreadInvoker interface BEFORE constructing the shared_ptr (rather than
+            // xmake_shared<ClassType>) so the shared_ptr control block is not templated
+            // on RetType/Args... -- one control-block type is then shared across every
+            // DelegateAsyncWait kind and signature instead of duplicated per signature.
+            // `rawClone` stays valid for the whole function (kept alive by `delegate`)
+            // and is used below to read back the clone's own result state.
+            ClassType* rawClone = this->Clone();
+            if (!rawClone)
                 BAD_ALLOC();
+            IThreadInvoker* invokerBase = rawClone;
+            std::shared_ptr<IThreadInvoker> delegate(invokerBase, std::default_delete<IThreadInvoker>(), dmq::stl_allocator<IThreadInvoker>());
 
-            // Create a new message instance for sending to the destination thread.
-            auto msg = xmake_shared<DelegateAsyncWaitMsg<Args...>>(delegate, m_priority, std::forward<Args>(args)...);
-            if (!msg)
-                BAD_ALLOC();
-            msg->SetInvokerWaiting(true);
-
-            bool waited = false;
-            auto thread = this->GetThread();
-            if (thread) {
-                // Dispatch message onto the callback destination thread. Invoke()
-                // will be called by the destination thread. 
-                if (thread->DispatchDelegate(msg)) {
-                    // Wait for destination thread to execute the delegate function and get return value
-                    waited = msg->GetSema().Wait(m_timeout);
-                }
+            // Dispatch to the destination thread and wait (up to the timeout) for
+            // Invoke() to run there and signal completion.
+            bool success = detail::DispatchAsyncWait(delegate, m_state.GetThread(), m_state.GetPriority(),
+                m_state.GetTimeout(), std::forward<Args>(args)...);
+            if (success) {
+                // Invoke() (running as the clone, on the destination thread) wrote the
+                // target function's return value into the clone's own state; pull it over.
+                m_state.SetResult(true, rawClone->m_state.RetVal());
             }
-
-            // Single lock: read return value and clear InvokerWaiting atomically
-            const dmq::LockGuard<Mutex> lock(msg->GetLock());
-            if (waited) {
-                // Only report success if the target function invoke actually completed;
-                // the semaphore is signaled even when the target function threw, so
-                // `waited` alone is not sufficient to know the call succeeded.
-                m_success = msg->GetInvokeSucceeded();
-                m_retVal = delegate->m_retVal;
-            }
-            // Set flag that source is not waiting anymore
-            msg->SetInvokerWaiting(false);
 
             // Does the target function have a return value?
             if constexpr (std::is_void<RetType>::value == false) {
-                // Is the return value valid? 
-                if (m_retVal.has_value()) {
+                // Is the return value valid?
+                if (m_state.RetVal().has_value()) {
                     // Return the destination thread target function return value
                     return GetRetVal();
                 } else {
@@ -454,7 +536,7 @@ public:
             } else {
                 // Invoke the target function using the source thread supplied function arguments
                 // and get the return value
-                m_retVal = std::apply(&BaseType::operator(), std::tuple_cat(std::make_tuple(this), delegateMsg->GetArgs()));
+                m_state.RetVal() = std::apply(&BaseType::operator(), std::tuple_cat(std::make_tuple(this), delegateMsg->GetArgs()));
             }
 
             // Only reached if the std::apply() call above did not throw
@@ -466,7 +548,7 @@ public:
     /// Returns `true` if asynchronous function successfully invoked on the target thread
     /// @return `true` if the target asynchronous function call succeeded. `false` if 
     /// the timeout expired before the target function could be invoked.
-    bool IsSuccess() noexcept { return m_success; }
+    bool IsSuccess() noexcept { return m_state.IsSuccess(); }
 
     /// Get the asynchronous function return value
     /// @return The destination thread target function return value
@@ -474,7 +556,7 @@ public:
         // Use pointer cast if exceptions are disabled OR if user requested Asserts-only mode
 #if !defined(__cpp_exceptions) || defined(DMQ_ASSERTS)
         // Fast, non-throwing check suitable for Embedded/Real-time
-        auto* p = std::any_cast<RetType>(&m_retVal);
+        auto* p = std::any_cast<RetType>(&m_state.RetVal());
         if (p) return *p;
 
         // Optional: If you want to trap this error in debug mode
@@ -485,7 +567,7 @@ public:
 #else
         // Standard C++ behavior with Exception Handling
         try {
-            return std::any_cast<RetType>(m_retVal);
+            return std::any_cast<RetType>(m_state.RetVal());
         }
         catch (const std::bad_any_cast&) {
             return RetType();
@@ -495,31 +577,22 @@ public:
 
     ///@brief Get the destination thread that the target function is invoked on.
     // @return The target thread.
-    IThread* GetThread() noexcept { return m_thread; }
+    IThread* GetThread() noexcept { return m_state.GetThread(); }
 
     /// @brief Get the delegate message priority
     /// @return Delegate message priority
-    Priority GetPriority() const noexcept { return m_priority; }
-    void SetPriority(Priority priority) noexcept { m_priority = priority; }
+    Priority GetPriority() const noexcept { return m_state.GetPriority(); }
+    void SetPriority(Priority priority) noexcept { m_state.SetPriority(priority); }
 
 private:
-    /// The target thread to invoke the delegate function.
-    IThread* m_thread = nullptr;
+    /// Destination thread, message priority, timeout, and last async call's result. Not
+    /// templated on Sig/TClass — see `detail::AsyncWaitDispatchState`.
+    detail::AsyncWaitDispatchState m_state;
 
-    /// Flag to control synchronous vs asynchronous target invoke behavior.
+    /// Flag to control synchronous vs asynchronous target invoke behavior. Deliberately
+    /// kept outside `m_state` — never copied/assigned/moved, see the note on
+    /// `detail::AsyncWaitDispatchState`.
     std::atomic<bool> m_sync{false};
-
-    /// Set to `true` if async function call succeeds
-    bool m_success = false;			        
-
-    /// Time in mS to wait for async function to invoke
-    Duration m_timeout = WAIT_INFINITE;    
-
-    /// Return value of the target invoked function
-    std::any m_retVal;
-
-    /// The delegate message priority
-    Priority m_priority = Priority::NORMAL;
 
     // </common_code>
 };
@@ -551,7 +624,7 @@ public:
     /// @param[in] timeout The calling thread timeout for destination thread to
     /// invoke the target function. 
     DelegateMemberAsyncWait(SharedPtr object, MemberFunc func, IThread& thread, Duration timeout = WAIT_INFINITE) :
-        BaseType(object, func), m_thread(&thread), m_timeout(timeout) {
+        BaseType(object, func) {
         Bind(object, func, thread, timeout);
     }
 
@@ -562,7 +635,7 @@ public:
     /// @param[in] timeout The calling thread timeout for destination thread to
     /// invoke the target function. 
     DelegateMemberAsyncWait(SharedPtr object, ConstMemberFunc func, IThread& thread, Duration timeout) :
-        BaseType(object, func), m_thread(&thread), m_timeout(timeout) {
+        BaseType(object, func) {
         Bind(object, func, thread, timeout);
     }
 
@@ -573,7 +646,7 @@ public:
     /// @param[in] timeout The calling thread timeout for destination thread to
     /// invoke the target function. 
     DelegateMemberAsyncWait(ObjectPtr object, MemberFunc func, IThread& thread, Duration timeout = WAIT_INFINITE) :
-        BaseType(object, func), m_thread(&thread), m_timeout(timeout) {
+        BaseType(object, func) {
         Bind(object, func, thread, timeout);
     }
 
@@ -584,7 +657,7 @@ public:
     /// @param[in] timeout The calling thread timeout for destination thread to
     /// invoke the target function. 
     DelegateMemberAsyncWait(ObjectPtr object, ConstMemberFunc func, IThread& thread, Duration timeout) :
-        BaseType(object, func), m_thread(&thread), m_timeout(timeout) {
+        BaseType(object, func) {
         Bind(object, func, thread, timeout);
     }
 
@@ -601,7 +674,7 @@ public:
     /// @brief Move constructor that transfers ownership of resources.
     /// @param[in] rhs The object to move from.
     DelegateMemberAsyncWait(ClassType&& rhs) noexcept :
-        BaseType(std::move(rhs)), m_thread(rhs.m_thread), m_priority(rhs.m_priority), m_timeout(rhs.m_timeout), m_success(rhs.m_success), m_retVal(rhs.m_retVal) {
+        BaseType(std::move(rhs)), m_state(rhs.m_state) {
         rhs.Clear();
     }
 
@@ -617,8 +690,8 @@ public:
     /// @param[in] timeout The calling thread timeout for destination thread to
     /// invoke the target function. 
     void Bind(SharedPtr object, MemberFunc func, IThread& thread, Duration timeout = WAIT_INFINITE) {
-        m_thread = &thread;
-        m_timeout = timeout;
+        m_state.SetThread(&thread);
+        m_state.SetTimeout(timeout);
         BaseType::Bind(object, func);
     }
 
@@ -632,8 +705,8 @@ public:
     /// @param[in] timeout The calling thread timeout for destination thread to
     /// invoke the target function. 
     void Bind(SharedPtr object, ConstMemberFunc func, IThread& thread, Duration timeout = WAIT_INFINITE) {
-        m_thread = &thread;
-        m_timeout = timeout;
+        m_state.SetThread(&thread);
+        m_state.SetTimeout(timeout);
         BaseType::Bind(object, func);
     }
 
@@ -647,8 +720,8 @@ public:
     /// @param[in] timeout The calling thread timeout for destination thread to
     /// invoke the target function. 
     void Bind(ObjectPtr object, MemberFunc func, IThread& thread, Duration timeout = WAIT_INFINITE) {
-        m_thread = &thread;
-        m_timeout = timeout;
+        m_state.SetThread(&thread);
+        m_state.SetTimeout(timeout);
         BaseType::Bind(object, func);
     }
 
@@ -662,8 +735,8 @@ public:
     /// @param[in] timeout The calling thread timeout for destination thread to
     /// invoke the target function. 
     void Bind(ObjectPtr object, ConstMemberFunc func, IThread& thread, Duration timeout = WAIT_INFINITE) {
-        m_thread = &thread;
-        m_timeout = timeout;
+        m_state.SetThread(&thread);
+        m_state.SetTimeout(timeout);
         BaseType::Bind(object, func);
     }
 
@@ -674,11 +747,7 @@ public:
     /// current object.
     /// @param[in] rhs The object whose state is to be copied.
     void Assign(const ClassType& rhs) {
-        m_thread = rhs.m_thread;
-        m_priority = rhs.m_priority;
-        m_timeout = rhs.m_timeout;
-        m_success = rhs.m_success;
-        m_retVal = rhs.m_retVal;
+        m_state = rhs.m_state;
         BaseType::Assign(rhs);
     }
 
@@ -709,11 +778,7 @@ public:
     ClassType& operator=(ClassType&& rhs) noexcept {
         if (&rhs != this) {
             BaseType::operator=(std::move(rhs));
-            m_thread = rhs.m_thread;    // Use the resource
-            m_priority = rhs.m_priority;
-            m_timeout = rhs.m_timeout;
-            m_success = rhs.m_success;
-            m_retVal = rhs.m_retVal;
+            m_state = rhs.m_state;    // Use the resource
             rhs.Clear();
         }
         return *this;
@@ -730,9 +795,7 @@ public:
     virtual bool Equal(const DelegateBase& rhs) const override {
         auto derivedRhs = dynamic_cast<const ClassType*>(&rhs);
         return derivedRhs &&
-            m_thread == derivedRhs->m_thread &&
-            m_priority == derivedRhs->m_priority &&
-            m_timeout == derivedRhs->m_timeout &&
+            m_state.Equal(derivedRhs->m_state) &&
             BaseType::Equal(rhs);
     }
 
@@ -786,8 +849,7 @@ public:
     /// @return The bound function return value, if any. Use `IsSuccess()` to determine if 
     /// the return value is valid before use.
     virtual RetType operator()(Args... args) override {
-        m_retVal.reset();
-        m_success = false;
+        m_state.ResetResult();
         if (this->Empty())
             return RetType();
 
@@ -796,44 +858,33 @@ public:
             // Invoke the target function directly
             return BaseType::operator()(std::forward<Args>(args)...);
         } else {
-            // Create a clone instance of this delegate 
-            auto delegate = xmake_shared<ClassType>(*this);
-            if (!delegate)
+            // Create a clone instance of this delegate. Erase to the non-templated
+            // IThreadInvoker interface BEFORE constructing the shared_ptr (rather than
+            // xmake_shared<ClassType>) so the shared_ptr control block is not templated
+            // on RetType/Args... -- one control-block type is then shared across every
+            // DelegateAsyncWait kind and signature instead of duplicated per signature.
+            // `rawClone` stays valid for the whole function (kept alive by `delegate`)
+            // and is used below to read back the clone's own result state.
+            ClassType* rawClone = this->Clone();
+            if (!rawClone)
                 BAD_ALLOC();
+            IThreadInvoker* invokerBase = rawClone;
+            std::shared_ptr<IThreadInvoker> delegate(invokerBase, std::default_delete<IThreadInvoker>(), dmq::stl_allocator<IThreadInvoker>());
 
-            // Create a new message instance for sending to the destination thread.
-            auto msg = xmake_shared<DelegateAsyncWaitMsg<Args...>>(delegate, m_priority, std::forward<Args>(args)...);
-            if (!msg)
-                BAD_ALLOC();
-            msg->SetInvokerWaiting(true);
-
-            bool waited = false;
-            auto thread = this->GetThread();
-            if (thread) {
-                // Dispatch message onto the callback destination thread. Invoke()
-                // will be called by the destination thread. 
-                if (thread->DispatchDelegate(msg)) {
-                    // Wait for destination thread to execute the delegate function and get return value
-                    waited = msg->GetSema().Wait(m_timeout);
-                }
+            // Dispatch to the destination thread and wait (up to the timeout) for
+            // Invoke() to run there and signal completion.
+            bool success = detail::DispatchAsyncWait(delegate, m_state.GetThread(), m_state.GetPriority(),
+                m_state.GetTimeout(), std::forward<Args>(args)...);
+            if (success) {
+                // Invoke() (running as the clone, on the destination thread) wrote the
+                // target function's return value into the clone's own state; pull it over.
+                m_state.SetResult(true, rawClone->m_state.RetVal());
             }
-
-            // Single lock: read return value and clear InvokerWaiting atomically
-            const dmq::LockGuard<Mutex> lock(msg->GetLock());
-            if (waited) {
-                // Only report success if the target function invoke actually completed;
-                // the semaphore is signaled even when the target function threw, so
-                // `waited` alone is not sufficient to know the call succeeded.
-                m_success = msg->GetInvokeSucceeded();
-                m_retVal = delegate->m_retVal;
-            }
-            // Set flag that source is not waiting anymore
-            msg->SetInvokerWaiting(false);
 
             // Does the target function have a return value?
             if constexpr (std::is_void<RetType>::value == false) {
-                // Is the return value valid? 
-                if (m_retVal.has_value()) {
+                // Is the return value valid?
+                if (m_state.RetVal().has_value()) {
                     // Return the destination thread target function return value
                     return GetRetVal();
                 } else {
@@ -902,7 +953,7 @@ public:
             } else {
                 // Invoke the target function using the source thread supplied function arguments
                 // and get the return value
-                m_retVal = std::apply(&BaseType::operator(), std::tuple_cat(std::make_tuple(this), delegateMsg->GetArgs()));
+                m_state.RetVal() = std::apply(&BaseType::operator(), std::tuple_cat(std::make_tuple(this), delegateMsg->GetArgs()));
             }
 
             // Only reached if the std::apply() call above did not throw
@@ -914,7 +965,7 @@ public:
     /// Returns `true` if asynchronous function successfully invoked on the target thread
     /// @return `true` if the target asynchronous function call succeeded. `false` if 
     /// the timeout expired before the target function could be invoked.
-    bool IsSuccess() noexcept { return m_success; }
+    bool IsSuccess() noexcept { return m_state.IsSuccess(); }
 
     /// Get the asynchronous function return value
     /// @return The destination thread target function return value
@@ -922,7 +973,7 @@ public:
         // Use pointer cast if exceptions are disabled OR if user requested Asserts-only mode
 #if !defined(__cpp_exceptions) || defined(DMQ_ASSERTS)
         // Fast, non-throwing check suitable for Embedded/Real-time
-        auto* p = std::any_cast<RetType>(&m_retVal);
+        auto* p = std::any_cast<RetType>(&m_state.RetVal());
         if (p) return *p;
 
         // Optional: If you want to trap this error in debug mode
@@ -933,7 +984,7 @@ public:
 #else
         // Standard C++ behavior with Exception Handling
         try {
-            return std::any_cast<RetType>(m_retVal);
+            return std::any_cast<RetType>(m_state.RetVal());
         }
         catch (const std::bad_any_cast&) {
             return RetType();
@@ -943,31 +994,22 @@ public:
 
     ///@brief Get the destination thread that the target function is invoked on.
     // @return The target thread.
-    IThread* GetThread() noexcept { return m_thread; }
+    IThread* GetThread() noexcept { return m_state.GetThread(); }
 
     /// @brief Get the delegate message priority
     /// @return Delegate message priority
-    Priority GetPriority() const noexcept { return m_priority; }
-    void SetPriority(Priority priority) noexcept { m_priority = priority; }
+    Priority GetPriority() const noexcept { return m_state.GetPriority(); }
+    void SetPriority(Priority priority) noexcept { m_state.SetPriority(priority); }
 
 private:
-    /// The target thread to invoke the delegate function.
-    IThread* m_thread = nullptr;
+    /// Destination thread, message priority, timeout, and last async call's result. Not
+    /// templated on Sig/TClass — see `detail::AsyncWaitDispatchState`.
+    detail::AsyncWaitDispatchState m_state;
 
-    /// Flag to control synchronous vs asynchronous target invoke behavior.
+    /// Flag to control synchronous vs asynchronous target invoke behavior. Deliberately
+    /// kept outside `m_state` — never copied/assigned/moved, see the note on
+    /// `detail::AsyncWaitDispatchState`.
     std::atomic<bool> m_sync{false};
-
-    /// Set to `true` if async function call succeeds
-    bool m_success = false;			        
-
-    /// Time in mS to wait for async function to invoke
-    Duration m_timeout = WAIT_INFINITE;    
-
-    /// Return value of the target invoked function
-    std::any m_retVal;
-
-    /// The delegate message priority
-    Priority m_priority = Priority::NORMAL;
 
     // </common_code>
 };
@@ -994,13 +1036,13 @@ public:
 
     /// @brief Constructor for non-const member function
     DelegateMemberAsyncWaitSp(SharedPtr object, MemberFunc func, IThread& thread, Duration timeout = WAIT_INFINITE) :
-        BaseType(object, func), m_thread(&thread), m_timeout(timeout) {
+        BaseType(object, func) {
         Bind(object, func, thread, timeout);
     }
 
     /// @brief Constructor for const member function
     DelegateMemberAsyncWaitSp(SharedPtr object, ConstMemberFunc func, IThread& thread, Duration timeout = WAIT_INFINITE) :
-        BaseType(object, func), m_thread(&thread), m_timeout(timeout) {
+        BaseType(object, func) {
         Bind(object, func, thread, timeout);
     }
 
@@ -1012,7 +1054,7 @@ public:
 
     /// @brief Move constructor
     DelegateMemberAsyncWaitSp(ClassType&& rhs) noexcept :
-        BaseType(std::move(rhs)), m_thread(rhs.m_thread), m_priority(rhs.m_priority), m_timeout(rhs.m_timeout), m_success(rhs.m_success), m_retVal(rhs.m_retVal) {
+        BaseType(std::move(rhs)), m_state(rhs.m_state) {
         rhs.Clear();
     }
 
@@ -1020,15 +1062,15 @@ public:
 
     /// @brief Bind a non-const member function
     void Bind(SharedPtr object, MemberFunc func, IThread& thread, Duration timeout = WAIT_INFINITE) {
-        m_thread = &thread;
-        m_timeout = timeout;
+        m_state.SetThread(&thread);
+        m_state.SetTimeout(timeout);
         BaseType::Bind(object, func);
     }
 
     /// @brief Bind a const member function
     void Bind(SharedPtr object, ConstMemberFunc func, IThread& thread, Duration timeout = WAIT_INFINITE) {
-        m_thread = &thread;
-        m_timeout = timeout;
+        m_state.SetThread(&thread);
+        m_state.SetTimeout(timeout);
         BaseType::Bind(object, func);
     }
 
@@ -1039,11 +1081,7 @@ public:
     /// current object.
     /// @param[in] rhs The object whose state is to be copied.
     void Assign(const ClassType& rhs) {
-        m_thread = rhs.m_thread;
-        m_priority = rhs.m_priority;
-        m_timeout = rhs.m_timeout;
-        m_success = rhs.m_success;
-        m_retVal = rhs.m_retVal;
+        m_state = rhs.m_state;
         BaseType::Assign(rhs);
     }
 
@@ -1074,11 +1112,7 @@ public:
     ClassType& operator=(ClassType&& rhs) noexcept {
         if (&rhs != this) {
             BaseType::operator=(std::move(rhs));
-            m_thread = rhs.m_thread;    // Use the resource
-            m_priority = rhs.m_priority;
-            m_timeout = rhs.m_timeout;
-            m_success = rhs.m_success;
-            m_retVal = rhs.m_retVal;
+            m_state = rhs.m_state;    // Use the resource
             rhs.Clear();
         }
         return *this;
@@ -1095,9 +1129,7 @@ public:
     virtual bool Equal(const DelegateBase& rhs) const override {
         auto derivedRhs = dynamic_cast<const ClassType*>(&rhs);
         return derivedRhs &&
-            m_thread == derivedRhs->m_thread &&
-            m_priority == derivedRhs->m_priority &&
-            m_timeout == derivedRhs->m_timeout &&
+            m_state.Equal(derivedRhs->m_state) &&
             BaseType::Equal(rhs);
     }
 
@@ -1151,8 +1183,7 @@ public:
     /// @return The bound function return value, if any. Use `IsSuccess()` to determine if 
     /// the return value is valid before use.
     virtual RetType operator()(Args... args) override {
-        m_retVal.reset();
-        m_success = false;
+        m_state.ResetResult();
         if (this->Empty())
             return RetType();
 
@@ -1161,44 +1192,33 @@ public:
             // Invoke the target function directly
             return BaseType::operator()(std::forward<Args>(args)...);
         } else {
-            // Create a clone instance of this delegate 
-            auto delegate = xmake_shared<ClassType>(*this);
-            if (!delegate)
+            // Create a clone instance of this delegate. Erase to the non-templated
+            // IThreadInvoker interface BEFORE constructing the shared_ptr (rather than
+            // xmake_shared<ClassType>) so the shared_ptr control block is not templated
+            // on RetType/Args... -- one control-block type is then shared across every
+            // DelegateAsyncWait kind and signature instead of duplicated per signature.
+            // `rawClone` stays valid for the whole function (kept alive by `delegate`)
+            // and is used below to read back the clone's own result state.
+            ClassType* rawClone = this->Clone();
+            if (!rawClone)
                 BAD_ALLOC();
+            IThreadInvoker* invokerBase = rawClone;
+            std::shared_ptr<IThreadInvoker> delegate(invokerBase, std::default_delete<IThreadInvoker>(), dmq::stl_allocator<IThreadInvoker>());
 
-            // Create a new message instance for sending to the destination thread.
-            auto msg = xmake_shared<DelegateAsyncWaitMsg<Args...>>(delegate, m_priority, std::forward<Args>(args)...);
-            if (!msg)
-                BAD_ALLOC();
-            msg->SetInvokerWaiting(true);
-
-            bool waited = false;
-            auto thread = this->GetThread();
-            if (thread) {
-                // Dispatch message onto the callback destination thread. Invoke()
-                // will be called by the destination thread. 
-                if (thread->DispatchDelegate(msg)) {
-                    // Wait for destination thread to execute the delegate function and get return value
-                    waited = msg->GetSema().Wait(m_timeout);
-                }
+            // Dispatch to the destination thread and wait (up to the timeout) for
+            // Invoke() to run there and signal completion.
+            bool success = detail::DispatchAsyncWait(delegate, m_state.GetThread(), m_state.GetPriority(),
+                m_state.GetTimeout(), std::forward<Args>(args)...);
+            if (success) {
+                // Invoke() (running as the clone, on the destination thread) wrote the
+                // target function's return value into the clone's own state; pull it over.
+                m_state.SetResult(true, rawClone->m_state.RetVal());
             }
-
-            // Single lock: read return value and clear InvokerWaiting atomically
-            const dmq::LockGuard<Mutex> lock(msg->GetLock());
-            if (waited) {
-                // Only report success if the target function invoke actually completed;
-                // the semaphore is signaled even when the target function threw, so
-                // `waited` alone is not sufficient to know the call succeeded.
-                m_success = msg->GetInvokeSucceeded();
-                m_retVal = delegate->m_retVal;
-            }
-            // Set flag that source is not waiting anymore
-            msg->SetInvokerWaiting(false);
 
             // Does the target function have a return value?
             if constexpr (std::is_void<RetType>::value == false) {
-                // Is the return value valid? 
-                if (m_retVal.has_value()) {
+                // Is the return value valid?
+                if (m_state.RetVal().has_value()) {
                     // Return the destination thread target function return value
                     return GetRetVal();
                 } else {
@@ -1267,7 +1287,7 @@ public:
             } else {
                 // Invoke the target function using the source thread supplied function arguments
                 // and get the return value
-                m_retVal = std::apply(&BaseType::operator(), std::tuple_cat(std::make_tuple(this), delegateMsg->GetArgs()));
+                m_state.RetVal() = std::apply(&BaseType::operator(), std::tuple_cat(std::make_tuple(this), delegateMsg->GetArgs()));
             }
 
             // Only reached if the std::apply() call above did not throw
@@ -1279,7 +1299,7 @@ public:
     /// Returns `true` if asynchronous function successfully invoked on the target thread
     /// @return `true` if the target asynchronous function call succeeded. `false` if 
     /// the timeout expired before the target function could be invoked.
-    bool IsSuccess() noexcept { return m_success; }
+    bool IsSuccess() noexcept { return m_state.IsSuccess(); }
 
     /// Get the asynchronous function return value
     /// @return The destination thread target function return value
@@ -1287,7 +1307,7 @@ public:
         // Use pointer cast if exceptions are disabled OR if user requested Asserts-only mode
 #if !defined(__cpp_exceptions) || defined(DMQ_ASSERTS)
         // Fast, non-throwing check suitable for Embedded/Real-time
-        auto* p = std::any_cast<RetType>(&m_retVal);
+        auto* p = std::any_cast<RetType>(&m_state.RetVal());
         if (p) return *p;
 
         // Optional: If you want to trap this error in debug mode
@@ -1298,7 +1318,7 @@ public:
 #else
         // Standard C++ behavior with Exception Handling
         try {
-            return std::any_cast<RetType>(m_retVal);
+            return std::any_cast<RetType>(m_state.RetVal());
         }
         catch (const std::bad_any_cast&) {
             return RetType();
@@ -1308,31 +1328,22 @@ public:
 
     ///@brief Get the destination thread that the target function is invoked on.
     // @return The target thread.
-    IThread* GetThread() noexcept { return m_thread; }
+    IThread* GetThread() noexcept { return m_state.GetThread(); }
 
     /// @brief Get the delegate message priority
     /// @return Delegate message priority
-    Priority GetPriority() const noexcept { return m_priority; }
-    void SetPriority(Priority priority) noexcept { m_priority = priority; }
+    Priority GetPriority() const noexcept { return m_state.GetPriority(); }
+    void SetPriority(Priority priority) noexcept { m_state.SetPriority(priority); }
 
 private:
-    /// The target thread to invoke the delegate function.
-    IThread* m_thread = nullptr;
+    /// Destination thread, message priority, timeout, and last async call's result. Not
+    /// templated on Sig/TClass — see `detail::AsyncWaitDispatchState`.
+    detail::AsyncWaitDispatchState m_state;
 
-    /// Flag to control synchronous vs asynchronous target invoke behavior.
+    /// Flag to control synchronous vs asynchronous target invoke behavior. Deliberately
+    /// kept outside `m_state` — never copied/assigned/moved, see the note on
+    /// `detail::AsyncWaitDispatchState`.
     std::atomic<bool> m_sync{false};
-
-    /// Set to `true` if async function call succeeds
-    bool m_success = false;			        
-
-    /// Time in mS to wait for async function to invoke
-    Duration m_timeout = WAIT_INFINITE;    
-
-    /// Return value of the target invoked function
-    std::any m_retVal;
-
-    /// The delegate message priority
-    Priority m_priority = Priority::NORMAL;
 
     // </common_code>
 };
@@ -1362,7 +1373,7 @@ public:
     /// @param[in] timeout The calling thread timeout for destination thread to
     /// invoke the target function. 
     DelegateFunctionAsyncWait(FunctionType func, IThread& thread, Duration timeout = WAIT_INFINITE) :
-        BaseType(func), m_thread(&thread), m_timeout(timeout) {
+        BaseType(func) {
         Bind(func, thread, timeout);
     }
 
@@ -1379,7 +1390,7 @@ public:
     /// @brief Move constructor that transfers ownership of resources.
     /// @param[in] rhs The object to move from.
     DelegateFunctionAsyncWait(ClassType&& rhs) noexcept :
-        BaseType(std::move(rhs)), m_thread(rhs.m_thread), m_priority(rhs.m_priority), m_timeout(rhs.m_timeout), m_success(rhs.m_success), m_retVal(rhs.m_retVal) {
+        BaseType(std::move(rhs)), m_state(rhs.m_state) {
         rhs.Clear();
     }
 
@@ -1394,8 +1405,8 @@ public:
     /// @param[in] timeout The calling thread timeout for destination thread to
     /// invoke the target function. 
     void Bind(FunctionType func, IThread& thread, Duration timeout = WAIT_INFINITE) {
-        m_thread = &thread;
-        m_timeout = timeout;
+        m_state.SetThread(&thread);
+        m_state.SetTimeout(timeout);
         BaseType::Bind(func);
     }
 
@@ -1406,11 +1417,7 @@ public:
     /// current object.
     /// @param[in] rhs The object whose state is to be copied.
     void Assign(const ClassType& rhs) {
-        m_thread = rhs.m_thread;
-        m_priority = rhs.m_priority;
-        m_timeout = rhs.m_timeout;
-        m_success = rhs.m_success;
-        m_retVal = rhs.m_retVal;
+        m_state = rhs.m_state;
         BaseType::Assign(rhs);
     }
 
@@ -1441,11 +1448,7 @@ public:
     ClassType& operator=(ClassType&& rhs) noexcept {
         if (&rhs != this) {
             BaseType::operator=(std::move(rhs));
-            m_thread = rhs.m_thread;    // Use the resource
-            m_priority = rhs.m_priority;
-            m_timeout = rhs.m_timeout;
-            m_success = rhs.m_success;
-            m_retVal = rhs.m_retVal;
+            m_state = rhs.m_state;    // Use the resource
             rhs.Clear();
         }
         return *this;
@@ -1462,9 +1465,7 @@ public:
     virtual bool Equal(const DelegateBase& rhs) const override {
         auto derivedRhs = dynamic_cast<const ClassType*>(&rhs);
         return derivedRhs &&
-            m_thread == derivedRhs->m_thread &&
-            m_priority == derivedRhs->m_priority &&
-            m_timeout == derivedRhs->m_timeout &&
+            m_state.Equal(derivedRhs->m_state) &&
             BaseType::Equal(rhs);
     }
 
@@ -1518,8 +1519,7 @@ public:
     /// @return The bound function return value, if any. Use `IsSuccess()` to determine if 
     /// the return value is valid before use.
     virtual RetType operator()(Args... args) override {
-        m_retVal.reset();
-        m_success = false;
+        m_state.ResetResult();
         if (this->Empty())
             return RetType();
 
@@ -1528,44 +1528,33 @@ public:
             // Invoke the target function directly
             return BaseType::operator()(std::forward<Args>(args)...);
         } else {
-            // Create a clone instance of this delegate 
-            auto delegate = xmake_shared<ClassType>(*this);
-            if (!delegate)
+            // Create a clone instance of this delegate. Erase to the non-templated
+            // IThreadInvoker interface BEFORE constructing the shared_ptr (rather than
+            // xmake_shared<ClassType>) so the shared_ptr control block is not templated
+            // on RetType/Args... -- one control-block type is then shared across every
+            // DelegateAsyncWait kind and signature instead of duplicated per signature.
+            // `rawClone` stays valid for the whole function (kept alive by `delegate`)
+            // and is used below to read back the clone's own result state.
+            ClassType* rawClone = this->Clone();
+            if (!rawClone)
                 BAD_ALLOC();
+            IThreadInvoker* invokerBase = rawClone;
+            std::shared_ptr<IThreadInvoker> delegate(invokerBase, std::default_delete<IThreadInvoker>(), dmq::stl_allocator<IThreadInvoker>());
 
-            // Create a new message instance for sending to the destination thread.
-            auto msg = xmake_shared<DelegateAsyncWaitMsg<Args...>>(delegate, m_priority, std::forward<Args>(args)...);
-            if (!msg)
-                BAD_ALLOC();
-            msg->SetInvokerWaiting(true);
-
-            bool waited = false;
-            auto thread = this->GetThread();
-            if (thread) {
-                // Dispatch message onto the callback destination thread. Invoke()
-                // will be called by the destination thread. 
-                if (thread->DispatchDelegate(msg)) {
-                    // Wait for destination thread to execute the delegate function and get return value
-                    waited = msg->GetSema().Wait(m_timeout);
-                }
+            // Dispatch to the destination thread and wait (up to the timeout) for
+            // Invoke() to run there and signal completion.
+            bool success = detail::DispatchAsyncWait(delegate, m_state.GetThread(), m_state.GetPriority(),
+                m_state.GetTimeout(), std::forward<Args>(args)...);
+            if (success) {
+                // Invoke() (running as the clone, on the destination thread) wrote the
+                // target function's return value into the clone's own state; pull it over.
+                m_state.SetResult(true, rawClone->m_state.RetVal());
             }
-
-            // Single lock: read return value and clear InvokerWaiting atomically
-            const dmq::LockGuard<Mutex> lock(msg->GetLock());
-            if (waited) {
-                // Only report success if the target function invoke actually completed;
-                // the semaphore is signaled even when the target function threw, so
-                // `waited` alone is not sufficient to know the call succeeded.
-                m_success = msg->GetInvokeSucceeded();
-                m_retVal = delegate->m_retVal;
-            }
-            // Set flag that source is not waiting anymore
-            msg->SetInvokerWaiting(false);
 
             // Does the target function have a return value?
             if constexpr (std::is_void<RetType>::value == false) {
-                // Is the return value valid? 
-                if (m_retVal.has_value()) {
+                // Is the return value valid?
+                if (m_state.RetVal().has_value()) {
                     // Return the destination thread target function return value
                     return GetRetVal();
                 } else {
@@ -1634,7 +1623,7 @@ public:
             } else {
                 // Invoke the target function using the source thread supplied function arguments
                 // and get the return value
-                m_retVal = std::apply(&BaseType::operator(), std::tuple_cat(std::make_tuple(this), delegateMsg->GetArgs()));
+                m_state.RetVal() = std::apply(&BaseType::operator(), std::tuple_cat(std::make_tuple(this), delegateMsg->GetArgs()));
             }
 
             // Only reached if the std::apply() call above did not throw
@@ -1646,7 +1635,7 @@ public:
     /// Returns `true` if asynchronous function successfully invoked on the target thread
     /// @return `true` if the target asynchronous function call succeeded. `false` if 
     /// the timeout expired before the target function could be invoked.
-    bool IsSuccess() noexcept { return m_success; }
+    bool IsSuccess() noexcept { return m_state.IsSuccess(); }
 
     /// Get the asynchronous function return value
     /// @return The destination thread target function return value
@@ -1654,7 +1643,7 @@ public:
         // Use pointer cast if exceptions are disabled OR if user requested Asserts-only mode
 #if !defined(__cpp_exceptions) || defined(DMQ_ASSERTS)
         // Fast, non-throwing check suitable for Embedded/Real-time
-        auto* p = std::any_cast<RetType>(&m_retVal);
+        auto* p = std::any_cast<RetType>(&m_state.RetVal());
         if (p) return *p;
 
         // Optional: If you want to trap this error in debug mode
@@ -1665,7 +1654,7 @@ public:
 #else
         // Standard C++ behavior with Exception Handling
         try {
-            return std::any_cast<RetType>(m_retVal);
+            return std::any_cast<RetType>(m_state.RetVal());
         }
         catch (const std::bad_any_cast&) {
             return RetType();
@@ -1675,31 +1664,22 @@ public:
 
     ///@brief Get the destination thread that the target function is invoked on.
     // @return The target thread.
-    IThread* GetThread() noexcept { return m_thread; }
+    IThread* GetThread() noexcept { return m_state.GetThread(); }
 
     /// @brief Get the delegate message priority
     /// @return Delegate message priority
-    Priority GetPriority() const noexcept { return m_priority; }
-    void SetPriority(Priority priority) noexcept { m_priority = priority; }
+    Priority GetPriority() const noexcept { return m_state.GetPriority(); }
+    void SetPriority(Priority priority) noexcept { m_state.SetPriority(priority); }
 
 private:
-    /// The target thread to invoke the delegate function.
-    IThread* m_thread = nullptr;
+    /// Destination thread, message priority, timeout, and last async call's result. Not
+    /// templated on Sig/TClass — see `detail::AsyncWaitDispatchState`.
+    detail::AsyncWaitDispatchState m_state;
 
-    /// Flag to control synchronous vs asynchronous target invoke behavior.
+    /// Flag to control synchronous vs asynchronous target invoke behavior. Deliberately
+    /// kept outside `m_state` — never copied/assigned/moved, see the note on
+    /// `detail::AsyncWaitDispatchState`.
     std::atomic<bool> m_sync{false};
-
-    /// Set to `true` if async function call succeeds
-    bool m_success = false;			        
-
-    /// Time in mS to wait for async function to invoke
-    Duration m_timeout = WAIT_INFINITE;    
-
-    /// Return value of the target invoked function
-    std::any m_retVal;
-
-    /// The delegate message priority
-    Priority m_priority = Priority::NORMAL;
 
     // </common_code>
 };
@@ -1812,6 +1792,8 @@ auto MakeDelegate(F&& func, IThread& thread, Duration timeout) {
 
 }
 
-#endif // DMQ_HAS_CV
+DMQ_OPTIMIZE_OFF
+
+#endif // DMQ_HAS_SEMAPHORE
 
 #endif

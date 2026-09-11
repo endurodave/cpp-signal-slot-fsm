@@ -46,11 +46,30 @@ if(NOT DEFINED DMQ_UTIL)
 endif()
 
 # --- DataBus Defaults ---
+# Keyed off DMQ_THREAD (the actual target), not WIN32/UNIX (the host doing
+# the compiling) -- DMQ_THREAD is already resolved above, and every RTOS
+# simulator sample (freertos-linux, threadx-linux, zephyr-linux) compiles
+# with a host GCC on a UNIX box despite targeting an embedded thread port,
+# which used to default DMQ_DATABUS on for them too. DataBus's
+# NetworkConnect.h reaches for the host's own BSD socket headers
+# unconditionally on Linux/macOS/Windows, which both wastes flash on a real
+# embedded build and can conflict outright with a target's own native
+# network stack headers (e.g. Zephyr's <zephyr/net/socket.h> redefining
+# sockaddr_in et al.) if a sample also pulls those in directly. RTOS/bare-
+# metal targets that genuinely want DataBus (e.g. databus-freertos/server)
+# already opt in explicitly by setting DMQ_DATABUS "ON" themselves.
+#
+# This exclusion list must stay in sync with DelegateOpt.h's
+# DMQ_THREAD_IS_EMBEDDED_RTOS macro (FreeRTOS/ThreadX/Zephyr/CMSIS-RTOS2) --
+# adding a new DMQ_THREAD_* port there means adding it here too. DMQ_THREAD_NONE
+# (bare metal) is excluded as well: there is no host to speak of.
 if(NOT DEFINED DMQ_DATABUS)
-    if(WIN32 OR UNIX)
-        set(DMQ_DATABUS "ON")
-    else()
+    if(DMQ_THREAD STREQUAL "DMQ_THREAD_FREERTOS" OR DMQ_THREAD STREQUAL "DMQ_THREAD_THREADX" OR
+       DMQ_THREAD STREQUAL "DMQ_THREAD_ZEPHYR" OR DMQ_THREAD STREQUAL "DMQ_THREAD_CMSIS_RTOS2" OR
+       DMQ_THREAD STREQUAL "DMQ_THREAD_NONE")
         set(DMQ_DATABUS "OFF")
+    else()
+        set(DMQ_DATABUS "ON")
     endif()
 endif()
 
