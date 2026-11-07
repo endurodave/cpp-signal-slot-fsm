@@ -29,6 +29,13 @@
 /// // From here, use DataBus::Subscribe / DataBus::Publish normally.
 /// @endcode
 ///
+/// A node can run several links on its one DataBus, e.g. a NetworkNode to Ethernet
+/// peers and a serial link to each MCU. Each link sends only the topics registered
+/// on it with Send(). A received topic reaches this node's subscribers only, unless
+/// it is received with Delivery::RELAY, which also forwards it out the other links
+/// that Send() it. Each peer takes two DataBus participants (reliable and
+/// unreliable) out of dmq::MAX_PARTICIPANTS, shared by all links in the process.
+///
 /// Topic ordering: Receive() and Send() may be called before or after Start() /
 /// AddPeer() in any order. NetworkNode defers registration and applies it
 /// retroactively when the participant is created.
@@ -61,6 +68,8 @@
     #include "port/os/stdlib/StdlibThread.h"
 #elif defined(DMQ_THREAD_WIN32)
     #include "port/os/win32/Win32Thread.h"
+#elif defined(DMQ_THREAD_POSIX)
+    #include "port/os/posix/PosixThread.h"
 #elif defined(DMQ_THREAD_FREERTOS)
     #include "port/os/freertos/FreeRTOSThread.h"
 #elif defined(DMQ_THREAD_THREADX)
@@ -81,6 +90,30 @@ enum class Reliability {
     RELIABLE,   ///< Transport send with ACK and automatic retry (RetryMonitor stack).
 };
 
+/// Where an incoming topic registered via NetworkNode::Receive() is delivered.
+enum class Delivery {
+    LOCAL, ///< This node's subscribers only (DataBus::AddIncomingTopic). The default; can't loop.
+    RELAY, ///< This node's subscribers, and forwarded out every link that Send()s the topic
+           ///< (DataBus::AddRelayTopic). For gateway nodes. Wire the topic one way: Send() it
+           ///< on the other link(s), not on the link it arrives on, or the originator gets
+           ///< it back (a duplicate, not a loop, as long as it receives the topic LOCAL).
+};
+
+namespace detail {
+/// Registers an incoming topic on a participant with the requested delivery.
+/// Shared by NetworkNode and other links with the same Receive() API.
+template <typename T>
+void AddReceivedTopic(void* serializer, const dmq::xstring& topic, dmq::DelegateRemoteId remoteId,
+                      Participant& participant, Delivery delivery)
+{
+    auto& ser = *static_cast<dmq::ISerializer<void(T)>*>(serializer);
+    if (delivery == Delivery::RELAY)
+        DataBus::AddRelayTopic<T>(topic, remoteId, participant, ser);
+    else
+        DataBus::AddIncomingTopic<T>(topic, remoteId, participant, ser);
+}
+} // namespace detail
+
 /// @brief Generic multi-peer DataBus network node.
 ///
 /// All member functions are safe to call before Start() or AddPeer(); registrations
@@ -94,6 +127,28 @@ class NetworkNode {
     using ReliableTransport = dmq::util::ReliableTransport;
 
 public:
+    /// Fired when a peer's unacked-message cap is exceeded (TransportMonitor::OnCapExceeded).
+    /// Subscribers receive: (peerName, count).
+    dmq::Signal<void(const dmq::xstring&, size_t)> OnPeerCapExceeded;
+
+    /// Fired when TransportMonitor::Process() can't drain a peer's expired entries
+    /// fast enough in one pass. Subscribers receive: (peerName, remaining).
+    dmq::Signal<void(const dmq::xstring&, size_t)> OnPeerPendingExceeded;
+
+    /// Fired when a RELIABLE message to a peer exhausts its retry budget without
+    /// being ACKed — the message is now permanently abandoned.
+    /// Subscribers receive: (peerName, remoteId, seqNum).
+    dmq::Signal<void(const dmq::xstring&, dmq::DelegateRemoteId, uint16_t)> OnDeliveryFailed;
+
+    /// Fired on every per-attempt send status for a RELIABLE message to a peer
+    /// (TransportMonitor::OnSendStatus): SUCCESS when an ACK arrives, or TIMEOUT
+    /// on each retry attempt before the budget is exhausted. A message may report
+    /// TIMEOUT several times while still being retried before either succeeding
+    /// or finally firing OnDeliveryFailed once -- see OnDeliveryFailed for the
+    /// permanent-abandonment signal this is deliberately kept separate from.
+    /// Subscribers receive: (peerName, remoteId, seqNum, status).
+    dmq::Signal<void(const dmq::xstring&, dmq::DelegateRemoteId, uint16_t, TransportMonitor::Status)> OnPeerSendStatus;
+
     NetworkNode()  = default;
     ~NetworkNode() { Stop(); }
 
@@ -118,7 +173,10 @@ public:
         char threadName[64];
         snprintf(threadName, sizeof(threadName), "%s_NetworkThread", nodeName);
 
-        if (m_recvTransport.Create(Transport::Type::SUB, "127.0.0.1", listenPort) != 0) {
+        // Listen on all interfaces so peers on other machines can reach this node.
+        // (LinuxUdpTransport binds the address it's given; the other UDP ports
+        // already bind INADDR_ANY for SUB and ignore it.)
+        if (m_recvTransport.Create(Transport::Type::SUB, "0.0.0.0", listenPort) != 0) {
             printf("NetworkNode [%s]: ERROR - failed to open recv port %u\n", nodeName, listenPort);
             return false;
         }
@@ -135,7 +193,8 @@ public:
             m_inTopics[i].adder(m_inTopics[i].serializer,
                                 m_inTopics[i].topic,
                                 m_inTopics[i].remoteId,
-                                *m_recvParticipant);
+                                *m_recvParticipant,
+                                m_inTopics[i].delivery);
 
         m_thread.emplace(
             threadName, 100, dmq::os::FullPolicy::FAULT, dmq::DEFAULT_DISPATCH_TIMEOUT);
@@ -164,7 +223,6 @@ public:
             m_running = false;
 
             m_recvTimer.Stop();
-            m_recvConn.Disconnect();
             m_recvTransport.Close();
         }
 
@@ -177,6 +235,13 @@ public:
         if (m_thread)
             m_thread->ExitThread();
 
+        // Disconnect only after ExitThread() above has drained m_thread's queue.
+        // Neither m_recvTimer.Stop() nor Disconnect() stops a tick that's already
+        // running, and a ProcessTimers() emit racing Stop() can still queue one.
+        // Draining first guarantees no ReceiverThread() call on `this` is left
+        // once Stop() returns, so the NetworkNode can be destroyed safely.
+        m_recvConn.Disconnect();
+
         dmq::LockGuard<dmq::RecursiveMutex> lock(m_mutex);
         for (size_t i = m_peerCount; i > 0; --i) {
             RemoteNode& node = m_peers[i - 1];
@@ -187,6 +252,8 @@ public:
             if (node.unreliableParticipant) node.unreliableParticipant->SetSendThread(nullptr);
             node.capConn.Disconnect();
             node.pendingConn.Disconnect();
+            node.deliveryFailedConn.Disconnect();
+            node.sendStatusConn.Disconnect();
             node.rawTransport.Close();
             node.active = false;
         }
@@ -204,11 +271,13 @@ public:
     void AddPeer(const char* name, const char* addr, uint16_t port)
     {
         dmq::LockGuard<dmq::RecursiveMutex> lock(m_mutex);
-        ASSERT_TRUE(m_peerCount < MaxPeers);
+        DMQ_ASSERT_TRUE(m_peerCount < MaxPeers);
 
         RemoteNode& node = m_peers[m_peerCount];
-        strncpy(node.name, name, sizeof(node.name) - 1);
-        node.name[sizeof(node.name) - 1] = '\0';
+        size_t nameLen = strlen(name);
+        if (nameLen >= sizeof(node.name)) nameLen = sizeof(node.name) - 1;
+        memcpy(node.name, name, nameLen);
+        node.name[nameLen] = '\0';
 
         if (node.rawTransport.Create(Transport::Type::PUB, addr, port) != 0) {
             printf("NetworkNode: ERROR - failed to connect to peer '%s' at %s:%u\n", name, addr, port);
@@ -234,14 +303,32 @@ public:
 
         dmq::xstring peerName(name);
         node.capConn = node.transportMonitor.OnCapExceeded.Connect(
-            dmq::MakeDelegate([peerName](size_t n) {
+            dmq::MakeDelegate([this, peerName](size_t n) {
                 printf("NetworkNode [%s]: cap exceeded (%zu unacked messages)\n",
                        peerName.c_str(), n);
+                this->OnPeerCapExceeded(peerName, n);
             }));
         node.pendingConn = node.transportMonitor.OnPendingExceeded.Connect(
-            dmq::MakeDelegate([peerName](size_t n) {
+            dmq::MakeDelegate([this, peerName](size_t n) {
                 printf("NetworkNode [%s]: pending exceeded (%zu entries remain)\n",
                        peerName.c_str(), n);
+                this->OnPeerPendingExceeded(peerName, n);
+            }));
+        node.deliveryFailedConn = node.retryMonitor.OnDeliveryFailed.Connect(
+            dmq::MakeDelegate([this, peerName](dmq::DelegateRemoteId id, uint16_t seq) {
+                printf("NetworkNode [%s]: delivery failed id=%u seq=%u (retries exhausted)\n",
+                       peerName.c_str(), id, seq);
+                this->OnDeliveryFailed(peerName, id, seq);
+            }));
+        node.sendStatusConn = node.transportMonitor.OnSendStatus.Connect(
+            dmq::MakeDelegate([this, peerName](dmq::DelegateRemoteId id, uint16_t seq, TransportMonitor::Status status) {
+                // Only TIMEOUT is print-worthy here -- SUCCESS fires on every
+                // acked RELIABLE message and would flood the log under normal load.
+                if (status == TransportMonitor::Status::TIMEOUT) {
+                    printf("NetworkNode [%s]: send status TIMEOUT id=%u seq=%u (retry pending)\n",
+                           peerName.c_str(), id, seq);
+                }
+                this->OnPeerSendStatus(peerName, id, seq, status);
             }));
 
         node.reliableParticipant   = dmq::xmake_shared<Participant>(node.reliableTransport);
@@ -284,7 +371,7 @@ public:
               Reliability rel = Reliability::UNRELIABLE)
     {
         dmq::LockGuard<dmq::RecursiveMutex> lock(m_mutex);
-        ASSERT_TRUE(m_outCount < MaxTopics);
+        DMQ_ASSERT_TRUE(m_outCount < MaxTopics);
         DataBus::RegisterSerializer<T>(topic, serializer);
         m_outTopics[m_outCount++] = {topic, remoteId, rel};
 
@@ -307,26 +394,27 @@ public:
     /// @param topic      DataBus topic string.
     /// @param remoteId   Wire ID embedded in the serialized frame.
     /// @param serializer Serializer instance for type T.
+    /// @param delivery   LOCAL (default): this node's subscribers only. RELAY: also
+    ///                   forwarded out every link that Send()s the topic, e.g. a
+    ///                   gateway passing Ethernet commands on to a serial MCU. See Delivery.
     template <typename T>
     void Receive(const dmq::xstring& topic,
                  dmq::DelegateRemoteId remoteId,
-                 dmq::ISerializer<void(T)>& serializer)
+                 dmq::ISerializer<void(T)>& serializer,
+                 Delivery delivery = Delivery::LOCAL)
     {
         dmq::LockGuard<dmq::RecursiveMutex> lock(m_mutex);
-        ASSERT_TRUE(m_inCount < MaxTopics);
+        DMQ_ASSERT_TRUE(m_inCount < MaxTopics);
 
         // Store a type-erased adder so it can be replayed when Start() creates the participant.
         m_inTopics[m_inCount++] = {
             topic, remoteId, static_cast<void*>(&serializer),
-            [](void* ser, const dmq::xstring& t, dmq::DelegateRemoteId rid, Participant& p) {
-                DataBus::AddIncomingTopic<T>(t, rid, p,
-                    *static_cast<dmq::ISerializer<void(T)>*>(ser));
-            }
+            &detail::AddReceivedTopic<T>, delivery
         };
 
         // Apply immediately if Start() has already run.
         if (m_recvParticipant)
-            DataBus::AddIncomingTopic<T>(topic, remoteId, *m_recvParticipant, serializer);
+            detail::AddReceivedTopic<T>(&serializer, topic, remoteId, *m_recvParticipant, delivery);
     }
 
 private:
@@ -383,6 +471,8 @@ private:
         ReliableTransport reliableTransport;   // Init(rawTransport, retryMonitor)
         dmq::ScopedConnection capConn;
         dmq::ScopedConnection pendingConn;
+        dmq::ScopedConnection deliveryFailedConn;
+        dmq::ScopedConnection sendStatusConn;
         std::shared_ptr<Participant> reliableParticipant;    // xmake_shared on construction
         std::shared_ptr<Participant> unreliableParticipant;  // xmake_shared on construction
         bool active = false;
@@ -391,13 +481,14 @@ private:
 
     // Type-erased incoming-topic record. Avoids storing template arguments past
     // the Receive() call site while preserving type-safe AddIncomingTopic<T>.
-    using TopicAdder = void(*)(void*, const dmq::xstring&, dmq::DelegateRemoteId, Participant&);
+    using TopicAdder = void(*)(void*, const dmq::xstring&, dmq::DelegateRemoteId, Participant&, Delivery);
 
     struct IncomingTopic {
         dmq::xstring          topic;
         dmq::DelegateRemoteId remoteId   = 0;
         void*                 serializer = nullptr;
         TopicAdder            adder      = nullptr;
+        Delivery              delivery   = Delivery::LOCAL;
     };
 
     struct OutgoingTopic {

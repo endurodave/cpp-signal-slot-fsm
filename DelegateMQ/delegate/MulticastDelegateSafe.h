@@ -4,8 +4,15 @@
 /// @file
 /// @brief Delegate container for storing and iterating over a collection of
 /// delegate instances. Class is thread-safe.
+///
+/// @note Invocation snapshots the delegates and calls them after releasing the
+/// lock, so a delegate removed on one thread may still be called once by an
+/// invocation already in progress on another. Removal does not make the target
+/// safe to destroy by itself; see the note in Signal.h.
 
 #include "MulticastDelegate.h"
+#include <algorithm>
+#include <array>
 
 DMQ_OPTIMIZE_ON
 
@@ -58,10 +65,7 @@ inline size_t MulticastSafeSnapshot(xlist<std::shared_ptr<DelegateBase>>& delega
     const dmq::LockGuard<RecursiveMutex> g(lock);
     size_t count = delegates.size();
     if (count <= smallCap) {
-        size_t i = 0;
-        for (auto& d : delegates) {
-            smallBuf[i++] = d;
-        }
+        std::copy(delegates.begin(), delegates.end(), smallBuf);
     } else {
         largeBuf = delegates;
     }
@@ -114,9 +118,9 @@ public:
         // is shared across every `MulticastDelegateSafe<Sig>` signature; only the final
         // invoke below needs the concrete `DelegateType` back. The snapshot-under-lock
         // logic itself lives in `detail::MulticastSafeSnapshot` for the same reason.
-        std::shared_ptr<DelegateBase> small_buf[SIGNAL_SBO_COUNT];
+        std::array<std::shared_ptr<DelegateBase>, SIGNAL_SBO_COUNT> small_buf;
         xlist<std::shared_ptr<DelegateBase>> large_buf;
-        size_t count = detail::MulticastSafeSnapshot(this->m_delegates, m_lock, small_buf, SIGNAL_SBO_COUNT, large_buf);
+        size_t count = detail::MulticastSafeSnapshot(this->m_delegates, m_lock, small_buf.data(), SIGNAL_SBO_COUNT, large_buf);
 
         if (count <= SIGNAL_SBO_COUNT) {
             for (size_t i = 0; i < count; ++i) {

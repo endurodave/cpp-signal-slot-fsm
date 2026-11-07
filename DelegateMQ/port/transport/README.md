@@ -1,6 +1,6 @@
-# Transport Layer
+# Transports (DelegateMQ Abstraction Layer)
 
-This directory contains the transport layer implementations for **DelegateMQ**, enabling remote function invocation across various physical media and protocols.
+This directory contains the transport part of the **DelegateMQ Abstraction Layer**: the `ITransport` implementations that enable remote function invocation across various physical media and protocols.
 
 ## Core Interfaces
 
@@ -18,17 +18,20 @@ The subdirectories contain ready-to-use transport implementations for specific p
 * **`mqtt`**: Publish/Subscribe messaging using **Paho MQTT**.
 * **`linux-tcp` / `linux-udp`**: Standard BSD socket implementations for Linux.
 * **`win32-tcp` / `win32-udp`**: Winsock implementations for Windows.
-* **`arm-lwip-udp`**: Lightweight IP (lwIP) implementation for embedded ARM (FreeRTOS/Bare-metal).
+* **`arm-lwip-udp`**: Lightweight IP (lwIP) raw-API implementation for embedded ARM (FreeRTOS/Bare-metal).
+* **`arm-lwip-netconn-udp`**: lwIP netconn-API UDP implementation for RTOS targets (selected via `DMQ_TRANSPORT_ARM_LWIP_NETCONN_UDP`).
 * **`netx-udp`**: Azure RTOS **NetX / NetX Duo** implementation for ThreadX (selected via `DMQ_TRANSPORT_THREADX_UDP`).
 * **`zephyr-udp`**: Native **Zephyr Networking** (BSD Socket API) implementation for Zephyr RTOS.
 
 ### IPC & Serial
 * **`win32-pipe`**: Inter-Process Communication (IPC) using Windows Named Pipes.
+* **`linux-uds`**: Inter-Process Communication (IPC) using Linux Unix domain datagram sockets (`AF_UNIX`, `SOCK_DGRAM`). Duplex, path-addressed, no start-order dependency. A stale socket file left by a crashed process is reused; a path still bound by a live process makes `Create()` fail. Socket access follows the directory's permissions, so prefer a per-user directory such as `$XDG_RUNTIME_DIR` over `/tmp` when other local users must not be able to send. Selected via `DMQ_TRANSPORT_LINUX_UDS`.
 * **`serial`**: Serial port (UART/RS-232) transport using **libserialport**.
+* **`stm32-uart`**: Interrupt-driven STM32 HAL UART transport for embedded targets (selected via `DMQ_TRANSPORT_STM32_UART`).
 
 ## Usage
 
-To use a specific transport, simply include the corresponding header in your application and inject it into your `dmq::util::Dispatcher` or `dmq::DelegateRemote`.
+To use a specific transport, simply include the corresponding header in your application and inject it into your `dmq::Dispatcher` or `dmq::DelegateRemote`.
 
 ```cpp
 // Example: Using UDP on Windows

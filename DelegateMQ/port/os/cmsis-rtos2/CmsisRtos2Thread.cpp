@@ -1,17 +1,20 @@
-#ifndef DMQ_THREAD_CMSIS_RTOS2
-#error "port/os/cmsis-rtos2/CmsisRtos2Thread.cpp requires DMQ_THREAD_CMSIS_RTOS2. Remove this file from your build configuration or define DMQ_THREAD_CMSIS_RTOS2."
-#endif
+// Compiles to nothing unless DMQ_THREAD_CMSIS_RTOS2 is selected, so every DelegateMQ source
+// file can be added to a build (see src/DelegateMQ.cpp).
+#include "delegate/DelegateSelect.h"
+#if defined(DMQ_THREAD_CMSIS_RTOS2)
 
 #include "DelegateMQ.h"
 #include "CmsisRtos2Thread.h"
+#include "CmsisRtos2Ticks.h"
 #include "port/os/common/ThreadMsg.h"
+#include "port/os/common/ThreadHooks.h"
 #include "extras/util/Fault.h"
 #include <cstdio>
 #include <new>
 
-// Define ASSERT_TRUE if not already defined
-#ifndef ASSERT_TRUE
-#define ASSERT_TRUE(x) if(!(x)) { while(1); }
+// Define DMQ_ASSERT_TRUE if not already defined
+#ifndef DMQ_ASSERT_TRUE
+#define DMQ_ASSERT_TRUE(x) if(!(x)) { while(1); }
 #endif
 
 namespace dmq::os {
@@ -45,7 +48,7 @@ CmsisRtos2Thread::~CmsisRtos2Thread()
 {
     ExitThread();
 
-    const std::lock_guard<dmq::RecursiveMutex> lock(GetWatchdogLock());
+    const dmq::LockGuard<dmq::RecursiveMutex> lock(GetWatchdogLock());
     CmsisRtos2Thread** pp = &GetWatchdogHead();
     while (*pp != nullptr)
     {
@@ -70,6 +73,11 @@ CmsisRtos2Thread::~CmsisRtos2Thread()
         osSemaphoreDelete(m_exitSem);
         m_exitSem = NULL;
     }
+
+    if (m_startSem) {
+        osSemaphoreDelete(m_startSem);
+        m_startSem = NULL;
+    }
 }
 
 //----------------------------------------------------------------------------
@@ -79,13 +87,28 @@ bool CmsisRtos2Thread::CreateThread(std::optional<dmq::Duration> watchdogTimeout
 {
     if (m_thread == NULL)
     {
+        // Reset from a previous ExitThread(), so the thread can be created again
+        m_exit.store(false);
+        // Held from creation, so the watchdog never sees a gated thread as hung
+        // before it reaches the gate (e.g. created before the scheduler runs)
+        m_startGate.OnCreate();
+        // Set before the thread exists: its loop reads the timeout before its
+        // first queue wait, and an idle thread waits forever with no timeout
+        m_lastAliveTime.store(Timer::GetNow());
+        m_watchdogTimeout.store(watchdogTimeout.value_or(dmq::Duration(0)));
+        m_discard.store(false);
+
         // 1. Create Exit Semaphore (Max 1, Initial 0)
-        // We use this to wait for the thread to shut down gracefully.
-        m_exitSem = osSemaphoreNew(1, 0, NULL);
-        ASSERT_TRUE(m_exitSem != NULL);
+        // We use this to wait for the thread to shut down gracefully. Created
+        // once and reused across ExitThread()/CreateThread() cycles (ExitThread()
+        // doesn't delete it; the destructor does), so a restart doesn't leak one.
+        if (m_exitSem == NULL) {
+            m_exitSem = osSemaphoreNew(1, 0, NULL);
+            DMQ_ASSERT_TRUE(m_exitSem != NULL);
+        }
 
         // 2. Create Message Queue
-        ASSERT_TRUE(m_queue.Create(m_queueSize));
+        DMQ_ASSERT_TRUE(m_queue.Create(m_queueSize));
 
         // 3. Create Thread
         osThreadAttr_t attr = {0};
@@ -93,16 +116,42 @@ bool CmsisRtos2Thread::CreateThread(std::optional<dmq::Duration> watchdogTimeout
         attr.stack_size = STACK_SIZE;
         attr.priority = m_priority;
 
+        // If the kernel is running, CreateThread() waits for the start handler.
+        // Before osKernelStart() it cannot block; the start handler then runs
+        // when the kernel starts, still before any message is processed.
+        //
+        // Zephyr's CMSIS-RTOS2 compatibility layer (subsys/portability/cmsis_rtos_v2/)
+        // never implements osKernelGetState() -- calling it is a link error -- but on
+        // Zephyr the kernel is already scheduling before main() runs (there is no
+        // separate osKernelStart() call on this backend; see cmsis-rtos2-linux's
+        // main_delegate.cpp), so it would always report osKernelRunning anyway.
+        // __ZEPHYR__ is defined by Zephyr's own build system on every compile.
+#if defined(__ZEPHYR__)
+        m_startSync = true;
+#else
+        m_startSync = (osKernelGetState() == osKernelRunning);
+#endif
+        if (m_startSync && m_startSem == NULL) {
+            m_startSem = osSemaphoreNew(1, 0, NULL);
+            DMQ_ASSERT_TRUE(m_startSem != NULL);
+        }
+
         m_thread = osThreadNew(CmsisRtos2Thread::Process, this, &attr);
-        ASSERT_TRUE(m_thread != NULL);
+        DMQ_ASSERT_TRUE(m_thread != NULL);
+
+        if (m_startSync) {
+            // m_thread is now stored: let Run() proceed to the start handler (see
+            // Run()), then wait for it to complete.
+            osThreadFlagsSet(m_thread, START_FLAG);
+            osSemaphoreAcquire(m_startSem, osWaitForever);
+        }
 
         m_lastAliveTime.store(Timer::GetNow());
 
         if (watchdogTimeout.has_value())
         {
-            m_watchdogTimeout = watchdogTimeout.value();
 
-            const std::lock_guard<dmq::RecursiveMutex> lock(GetWatchdogLock());
+            const dmq::LockGuard<dmq::RecursiveMutex> lock(GetWatchdogLock());
 
             // Add to watchdog registry if not already present
             bool found = false;
@@ -151,11 +200,18 @@ osPriority_t CmsisRtos2Thread::GetThreadPriority()
 //----------------------------------------------------------------------------
 // ExitThread
 //----------------------------------------------------------------------------
-void CmsisRtos2Thread::ExitThread()
+void CmsisRtos2Thread::ExitThread(ExitPolicy policy)
 {
     if (m_queue.IsCreated())
     {
+        // Set before m_exit: Run() reads it for every message ahead of the exit message
+        m_discard.store(policy == ExitPolicy::DISCARD);
         m_exit.store(true);
+
+        // A thread held at its start gate isn't waiting on its queue: wake it so it
+        // sees the exit flag (set above) and leaves. Never touches the gate itself,
+        // which may be destroyed once the thread is released.
+        m_startGate.Wake();
 
         // Check self-exit BEFORE attempting to enqueue the exit message. If
         // this thread is destroying itself from within its own dispatched
@@ -166,7 +222,8 @@ void CmsisRtos2Thread::ExitThread()
         // checks m_selfExitPtr immediately after the current callback invoke
         // returns, and unwinds without touching 'this' again.
         if (osThreadGetId() == m_thread) {
-            if (m_selfExitPtr) *m_selfExitPtr = true;
+            if (m_selfExitPtr) { *m_selfExitPtr = true; m_selfExitPtr = nullptr; }
+            m_startGate.Leave();     // exited from its start handler: never reaches the gate
         } else {
             // Send exit message
             ThreadMsg* msg = new (std::nothrow) ThreadMsg(MSG_EXIT_THREAD);
@@ -185,6 +242,11 @@ void CmsisRtos2Thread::ExitThread()
 
         // Thread has finished Run(). Now we can safely clean up resources.
         m_thread = NULL;
+
+        // The thread has finished (or, on a self-exit, is in its last handler):
+        // stop watchdog checks. Not earlier, so a thread that hangs while
+        // ExitThread() waits for it is still reported.
+        m_watchdogTimeout.store(dmq::Duration(0));
 
         m_queue.DrainAndDelete();
         m_queue.Destroy();
@@ -232,7 +294,7 @@ void CmsisRtos2Thread::Sleep(dmq::Duration timeout) {
 //----------------------------------------------------------------------------
 bool CmsisRtos2Thread::DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg)
 {
-    ASSERT_TRUE(m_queue.IsCreated());
+    DMQ_ASSERT_TRUE(m_queue.IsCreated());
 
     // 1. Allocate message container
     ThreadMsg* threadMsg = new (std::nothrow) ThreadMsg(MSG_DISPATCH_DELEGATE, msg);
@@ -244,19 +306,24 @@ bool CmsisRtos2Thread::DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg)
     // 2. Send pointer to queue
     uint32_t timeout;
     if (FULL_POLICY == FullPolicy::TIMEOUT)
-        timeout = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(m_dispatchTimeout).count());
+        timeout = CmsisRtos2ToTicks(m_dispatchTimeout);
     else
         timeout = 0;  // DROP and FAULT: non-blocking
 
-    // High priority uses osMessageQueuePut's native msg_prio argument.
+    // High priority goes to the queue's HIGH lane, drained first (see CmsisRtos2DelegateQueue).
     bool sent = m_queue.Send(threadMsg, msg->GetPriority() == Priority::HIGH, timeout);
     if (!sent)
     {
         if (FULL_POLICY == FullPolicy::FAULT) {
             printf("[Thread] CRITICAL: Queue full on thread '%s'! TRIGGERING FAULT.\n", THREAD_NAME.c_str());
-            ASSERT_TRUE(sent);
+            DMQ_ASSERT_TRUE(sent);
         } else if (FULL_POLICY == FullPolicy::TIMEOUT) {
             printf("[Thread] WARNING: Queue post timed out on '%s' — possible deadlock. Message dropped.\n", THREAD_NAME.c_str());
+            if (m_droppedHandler)
+                m_droppedHandler(GetQueueSize());
+        } else { // DROP
+            if (m_droppedHandler)
+                m_droppedHandler(GetQueueSize());
         }
         // Failed to send (queue full or timed out)
         delete threadMsg;
@@ -295,6 +362,9 @@ void CmsisRtos2Thread::Process(void* argument)
 //----------------------------------------------------------------------------
 void CmsisRtos2Thread::WatchdogCheck()
 {
+    if (m_startGate.IsHeld())
+        return;     // held at its start gate by design, not hung
+
     auto now = Timer::GetNow();
     auto lastAlive = m_lastAliveTime.load();
     auto watchdogTimeout = m_watchdogTimeout.load();
@@ -322,7 +392,7 @@ void CmsisRtos2Thread::ThreadCheck()
 //----------------------------------------------------------------------------
 void CmsisRtos2Thread::WatchdogCheckAll()
 {
-    const std::lock_guard<dmq::RecursiveMutex> lock(GetWatchdogLock());
+    const dmq::LockGuard<dmq::RecursiveMutex> lock(GetWatchdogLock());
     CmsisRtos2Thread* p = GetWatchdogHead();
     while (p != nullptr)
     {
@@ -354,9 +424,53 @@ void CmsisRtos2Thread::Run()
     bool selfExit = false;
     m_selfExitPtr = &selfExit;
 
+    // Exit and idle handlers are copied onto this stack frame so they work on
+    // every return path, including a self-exit where 'this' may already be freed.
+    ThreadExitGuard exitGuard(m_exitHandler);
+    ThreadIdleTimer idle(m_idleHandler, m_idleInterval);
+
+    // osThreadNew() returns m_thread only after this thread may already be
+    // running; wait for CreateThread() so the start handler can use it.
+    const bool startSync = m_startSync;
+    if (startSync)
+        osThreadFlagsWait(START_FLAG, osFlagsWaitAny, osWaitForever);
+
+    // dmq::ThisThread::GetCurrent() returns this thread from here on. Reset
+    // before the exit handler runs (and destroyed before exitGuard on a
+    // self-exit), so the exit handler sees nullptr.
+    std::optional<dmq::CurrentThreadScope> currentScope;
+    currentScope.emplace(this);
+
+    if (m_startHandler)
+        m_startHandler();
+
+    // A start handler that exited this thread (ExitThread() on itself) leaves
+    // right after the signal below: once CreateThread() returns, the Thread may
+    // be destroyed, so nothing after the signal may touch 'this'.
+    const bool exitedInStart = selfExit;
+
+    if (startSync)
+        osSemaphoreRelease(m_startSem);
+    if (exitedInStart)
+        return;
+
+    // Optional start gate: wait here, ready but processing nothing, until it opens
+    if (m_startGate.Enabled())
+    {
+        const bool opened = m_startGate.Wait(m_exit);
+        m_lastAliveTime.store(Timer::GetNow());   // before Passed(): no stale watchdog read
+        m_startGate.Passed();
+        // ExitThread() while held: run nothing. Cancel each queued message
+        // (DISCARD) until the exit message. Consuming them also keeps
+        // ExitThread()'s blocking send of the exit message from waiting on a
+        // full queue.
+        if (!opened)
+            m_discard.store(true);
+    }
+
     ThreadMsg* msg = nullptr;
 
-    while (!selfExit && !m_exit.load())
+    while (!selfExit)
     {
         dmq::Duration watchdogTimeout;
         {
@@ -365,21 +479,49 @@ void CmsisRtos2Thread::Run()
         }
 
         // If watchdog active, use a finite timeout so we can periodically update 
-        // m_lastAliveTime while idle. Otherwise, block forever to save power.
+        // m_lastAliveTime while idle. If an idle handler is set, wake no later
+        // than when it is due. Otherwise, block forever to save power.
         uint32_t waitOption = osWaitForever;
         if (watchdogTimeout.count() > 0)
         {
-            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(watchdogTimeout).count();
-            waitOption = static_cast<uint32_t>(ms / 4);
-            if (waitOption == 0) waitOption = 1;
+            // Divide in microseconds so a 1-3 ms watchdog doesn't truncate to 0;
+            // CmsisRtos2ToTicks() rounds any nonzero wait up to at least 1 tick.
+            waitOption = CmsisRtos2ToTicks(
+                std::chrono::duration_cast<std::chrono::microseconds>(watchdogTimeout) / dmq::WATCHDOG_HEARTBEAT_DIVISOR);
+        }
+        if (idle.Enabled())
+        {
+            uint32_t idleTicks = CmsisRtos2ToTicks(idle.WaitTime(dmq::Duration(-1)));
+            if (idleTicks < waitOption) waitOption = idleTicks;
         }
 
         // Block for a message or timeout
         msg = m_queue.Receive(waitOption);
-        if (msg != nullptr)
+        if (msg == nullptr)
+        {
+            // Exit requested but no exit message arrived (e.g. it could not be allocated)
+            if (m_exit.load())
+                break;
+
+            // Timed out with the queue empty: run the idle handler if it is due
+            if (idle.IsDue())
+            {
+                idle.Run();
+                // The idle handler exited this thread (and may have deleted it): leave
+                // without touching 'this', as the message path does
+                if (selfExit)
+                    return;
+            }
+        }
+        else
         {
             int msgId = msg->GetId();
-            if (msgId == MSG_DISPATCH_DELEGATE)
+            if (msgId == MSG_DISPATCH_DELEGATE && m_discard.load())
+            {
+                // ExitPolicy::DISCARD: skip messages queued ahead of the exit message
+                CancelThreadMsg(*msg);
+            }
+            else if (msgId == MSG_DISPATCH_DELEGATE)
             {
             #if defined(DMQ_DATABUS_TOOLS)
                 // Update latency stats before invoking
@@ -396,9 +538,9 @@ void CmsisRtos2Thread::Run()
             #endif
 
                 auto delegateMsg = msg->GetData();
-                ASSERT_TRUE(delegateMsg);
+                DMQ_ASSERT_TRUE(delegateMsg);
                 auto invoker = delegateMsg->GetInvoker();
-                ASSERT_TRUE(invoker);
+                DMQ_ASSERT_TRUE(invoker);
 
 #if defined(DMQ_DATABUS_TOOLS)
                 dmq::TimePoint start = Timer::GetNow();
@@ -407,35 +549,34 @@ void CmsisRtos2Thread::Run()
                 bool success = false;
                 try {
                     success = invoker->Invoke(delegateMsg);
-                    ASSERT_TRUE(success);
+                    if (!selfExit) DMQ_ASSERT_TRUE(success);
                 }
                 catch (const std::bad_alloc& e) {
                     std::cerr << "[Thread:" << THREAD_NAME << "] Unhandled bad_alloc in delegate callback: " << e.what() << std::endl;
-                    ASSERT();
+                    DMQ_ASSERT();
                 }
                 catch (const std::invalid_argument& e) {
                     std::cerr << "[Thread:" << THREAD_NAME << "] Unhandled invalid_argument in delegate callback: " << e.what() << std::endl;
-                    ASSERT();
+                    DMQ_ASSERT();
                 }
                 catch (const std::runtime_error& e) {
                     std::cerr << "[Thread:" << THREAD_NAME << "] Unhandled runtime_error in delegate callback: " << e.what() << std::endl;
-                    ASSERT();
+                    DMQ_ASSERT();
                 }
                 catch (const std::exception& e) {
                     printf("[Thread:%s] Unhandled exception in delegate callback: %s\n", THREAD_NAME.c_str(), e.what());
-                    ASSERT();
+                    DMQ_ASSERT();
                 }
                 catch (...) {
                     printf("[Thread:%s] Unhandled unknown exception in delegate callback.\n", THREAD_NAME.c_str());
-                    ASSERT();
+                    DMQ_ASSERT();
                 }
 #else
                 bool success = invoker->Invoke(delegateMsg);
-                if (!selfExit) ASSERT_TRUE(success);
+                if (!selfExit) DMQ_ASSERT_TRUE(success);
 #endif
                 if (selfExit) {
                     delete msg;
-                    m_selfExitPtr = nullptr;
                     return;
                 }
 
@@ -457,14 +598,22 @@ void CmsisRtos2Thread::Run()
             if (msgId == MSG_EXIT_THREAD) {
                 break;
             }
+
+            // Any message restarts the idle countdown
+            idle.Restart();
         }
     }
 
+    // Run the exit handler before signalling ExitThread(), so it returns only after it
+    currentScope.reset();
+    exitGuard.Fire();
+
+    // Clear before signalling: once ExitThread() returns, 'this' may be destroyed
+    m_selfExitPtr = nullptr;
     // Signal ExitThread() that we are done
     if (m_exitSem) {
         osSemaphoreRelease(m_exitSem);
     }
-    m_selfExitPtr = nullptr;
 }
 
 #if defined(DMQ_DATABUS_TOOLS)
@@ -518,3 +667,5 @@ CmsisRtos2Thread::ThreadStats CmsisRtos2Thread::SnapshotStats()
 #endif
 
 } // namespace dmq::os
+
+#endif // DMQ_THREAD_CMSIS_RTOS2

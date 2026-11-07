@@ -1,3 +1,9 @@
+// Default FaultHandler()/WatchdogHandler(). An application that provides its
+// own defines DMQ_CUSTOM_FAULT_HANDLER, and this file compiles to nothing, so
+// it can stay in a build that adds every DelegateMQ source (see src/DelegateMQ.cpp).
+#include "delegate/DelegateSelect.h"
+#if !defined(DMQ_CUSTOM_FAULT_HANDLER)
+
 #include "extras/util/Fault.h"
 #include <cstdio>
 #include <cstdlib>
@@ -275,9 +281,11 @@ extern "C" DMQ_NORETURN void WatchdogHandler(const char* threadName)
     std::cout << "\n************************************************" << std::endl;
     std::cout << "WATCHDOG EXPIRED: " << threadName << std::endl;
     std::cout << "************************************************\n" << std::endl;
-    ASSERT();
+    DMQ_ASSERT();
 #else
     printf("WATCHDOG EXPIRED: %s\r\n", threadName);
     while (1);
 #endif
 }
+
+#endif // !DMQ_CUSTOM_FAULT_HANDLER

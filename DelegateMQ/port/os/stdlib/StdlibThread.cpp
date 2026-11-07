@@ -1,13 +1,18 @@
-#ifndef DMQ_THREAD_STDLIB
-#error "port/os/stdlib/StdlibThread.cpp requires DMQ_THREAD_STDLIB. Remove this file from your build configuration or define DMQ_THREAD_STDLIB."
-#endif
+// Compiles to nothing unless DMQ_THREAD_STDLIB is selected, so every DelegateMQ source
+// file can be added to a build (see src/DelegateMQ.cpp).
+#include "delegate/DelegateSelect.h"
+#if defined(DMQ_THREAD_STDLIB)
 
 #include "DelegateMQ.h"
 #include "StdlibThread.h"
+#include "port/os/common/ThreadHooks.h"
 #include "extras/util/Fault.h"
 
 #ifdef _WIN32
 #include <Windows.h>
+#endif
+#ifdef __linux__
+#include <pthread.h>
 #endif
 
 // Thread-local pointer into Process()'s stack frame. Set non-null only while
@@ -18,7 +23,6 @@ static thread_local bool* t_self_exit = nullptr;
 
 namespace dmq::os {
 
-using namespace std;
 using namespace dmq::util;
 
 //----------------------------------------------------------------------------
@@ -29,7 +33,7 @@ StdlibThread::StdlibThread(const char* threadName, size_t maxQueueSize, FullPoli
     , m_exit(false)
     , THREAD_NAME(threadName)
     , CPU_NAME(cpuName)
-    , MAX_QUEUE_SIZE(maxQueueSize)
+    , MAX_QUEUE_SIZE(maxQueueSize == 0 ? dmq::THREAD_DESKTOP_QUEUE_SIZE : maxQueueSize)
     , FULL_POLICY(fullPolicy)
     , m_dispatchTimeout(dispatchTimeout)
 {
@@ -66,13 +70,26 @@ bool StdlibThread::CreateThread(std::optional<dmq::Duration> watchdogTimeout)
         m_threadStartPromise.emplace();
         m_threadStartFuture.emplace(m_threadStartPromise->get_future());
         m_exit = false;
+        // Held from creation, so the watchdog never sees a gated thread as hung
+        // before it reaches the gate (e.g. created before the scheduler runs)
+        m_startGate.OnCreate();
+        // Set before the thread exists: its loop reads the timeout before its
+        // first queue wait, and an idle thread waits forever with no timeout
+        m_lastAliveTime.store(Timer::GetNow());
+        m_watchdogTimeout.store(watchdogTimeout.value_or(dmq::Duration(0)));
 
-        m_thread.emplace(&StdlibThread::Process, this);
+        {
+            // Held until m_thread is fully constructed and named. Process() takes
+            // this lock before running the start handler, which may call
+            // IsCurrentThread() or dispatch to this thread (both read m_thread).
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_thread.emplace(&StdlibThread::Process, this);
 
-        auto handle = m_thread->native_handle();
-        SetThreadName(handle, THREAD_NAME);
+            auto handle = m_thread->native_handle();
+            SetThreadName(handle, THREAD_NAME);
+        }
 
-        // Wait for the thread to enter the Process method
+        // Wait for the thread to run the start handler and enter its loop
         m_threadStartFuture->get();
 
         m_lastAliveTime.store(Timer::GetNow());
@@ -80,7 +97,6 @@ bool StdlibThread::CreateThread(std::optional<dmq::Duration> watchdogTimeout)
         // Caller wants a watchdog timer?
         if (watchdogTimeout.has_value())
         {
-            m_watchdogTimeout = watchdogTimeout.value();
 
             // Add to watchdog registry if not already present
             {
@@ -123,7 +139,7 @@ std::thread::id StdlibThread::GetThreadId()
 //----------------------------------------------------------------------------
 std::thread::id StdlibThread::GetCurrentThreadId()
 {
-    return this_thread::get_id();
+    return std::this_thread::get_id();
 }
 
 //----------------------------------------------------------------------------
@@ -142,7 +158,7 @@ bool StdlibThread::IsCurrentThread()
 //----------------------------------------------------------------------------
 size_t StdlibThread::GetQueueSize()
 {
-    lock_guard<mutex> lock(m_mutex);
+    std::lock_guard<std::mutex> lock(m_mutex);
     return (m_highQueue.size() + m_normalQueue.size());
 }
 
@@ -165,13 +181,16 @@ void StdlibThread::SetThreadName(std::thread::native_handle_type handle, const d
     {
         // Handle error if needed
     }
+#elif defined(__linux__)
+    // Shown by top -H, ps -L, gdb and perf. Linux limits names to 15 characters.
+    pthread_setname_np(handle, name.substr(0, 15).c_str());
 #endif
 }
 
 //----------------------------------------------------------------------------
 // ExitThread
 //----------------------------------------------------------------------------
-void StdlibThread::ExitThread()
+void StdlibThread::ExitThread(ExitPolicy policy)
 {
     if (!m_thread)
         return;
@@ -179,12 +198,23 @@ void StdlibThread::ExitThread()
     // Create a new ThreadMsg
     auto threadMsg = xmake_shared<ThreadMsg>(MSG_EXIT_THREAD, nullptr);
 
+    // Messages taken off the queues without being invoked; canceled outside the lock
+    decltype(m_highQueue) discardedHigh;
+    decltype(m_normalQueue) discardedNormal;
+
     {
-        lock_guard<mutex> lock(m_mutex);
+        std::lock_guard<std::mutex> lock(m_mutex);
 
         // Set exit flag INSIDE lock before notifying.
         // This ensures that when a blocked producer wakes up, it sees m_exit == true immediately.
         m_exit.store(true);
+
+        // DISCARD: empty the queues so the exit message is the next one processed
+        if (policy == ExitPolicy::DISCARD)
+        {
+            discardedHigh.swap(m_highQueue);
+            discardedNormal.swap(m_normalQueue);
+        }
 
         // Explicitly allow Exit message to bypass the MAX_QUEUE_SIZE limit.
         // We do not wait on m_cvNotFull here to prevent deadlock during shutdown.
@@ -198,6 +228,14 @@ void StdlibThread::ExitThread()
         // Wake up blocked producers (DispatchDelegate)
         m_cvNotFull.notify_all();
     }
+
+    CancelAll(discardedHigh);
+    CancelAll(discardedNormal);
+
+    // A thread held at its start gate isn't waiting on its queue: wake it so it
+    // sees the exit flag (set above) and leaves. Never touches the gate itself,
+    // which may be destroyed once the thread is released.
+    m_startGate.Wake();
 
     // Prevent deadlock if ExitThread is called from within the thread itself
     if (m_thread->joinable())
@@ -213,18 +251,30 @@ void StdlibThread::ExitThread()
             // Signal Process() (running on this thread) to exit without touching
             // 'this' again — the owning object is about to be freed.
             if (t_self_exit) *t_self_exit = true;
+            m_startGate.Leave();     // exited from its start handler: never reaches the gate
         }
     }
 
+    // The thread has finished (or, on a self-exit, is in its last handler):
+    // stop watchdog checks. Not earlier, so a thread that hangs while
+    // ExitThread() waits for it is still reported.
+    m_watchdogTimeout.store(dmq::Duration(0));
+
     {
-        lock_guard<mutex> lock(m_mutex);
+        std::lock_guard<std::mutex> lock(m_mutex);
         m_thread.reset();
-        m_highQueue.clear();
-        m_normalQueue.clear();
+
+        // Normally empty. After a self-exit the loop returns without draining,
+        // so anything still queued is discarded here.
+        discardedHigh.swap(m_highQueue);
+        discardedNormal.swap(m_normalQueue);
 
         // Final cleanup notification
         m_cvNotFull.notify_all();
     }
+
+    CancelAll(discardedHigh);
+    CancelAll(discardedNormal);
 }
 
 //----------------------------------------------------------------------------
@@ -245,12 +295,18 @@ bool StdlibThread::DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg)
     if (MAX_QUEUE_SIZE > 0 && (m_highQueue.size() + m_normalQueue.size()) >= MAX_QUEUE_SIZE)
     {
         if (FULL_POLICY == FullPolicy::DROP)
+        {
+            size_t depth = m_highQueue.size() + m_normalQueue.size();
+            lk.unlock();
+            if (m_droppedHandler)
+                m_droppedHandler(depth);
             return false;  // silently discard — caller is not stalled, no allocation wasted
+        }
 
         if (FULL_POLICY == FullPolicy::FAULT)
         {
             printf("[Thread] CRITICAL: Queue full on thread '%s'! TRIGGERING FAULT.\n", THREAD_NAME.c_str());
-            ASSERT_TRUE(false);
+            DMQ_ASSERT_TRUE(false);
             return false;
         }
 
@@ -261,6 +317,10 @@ bool StdlibThread::DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg)
             });
             if (!hasSpace) {
                 printf("[Thread] WARNING: Queue post timed out on '%s' — possible deadlock. Message dropped.\n", THREAD_NAME.c_str());
+                size_t depth = m_highQueue.size() + m_normalQueue.size();
+                lk.unlock();
+                if (m_droppedHandler)
+                    m_droppedHandler(depth);
                 return false;
             }
             // space found — fall through to push
@@ -294,7 +354,7 @@ bool StdlibThread::DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg)
 #if defined(DMQ_DATABUS_TOOLS)
     // Update monitoring stats under the separate stats mutex
     {
-        lock_guard<mutex> lock(m_statsMutex);
+        std::lock_guard<std::mutex> lock(m_statsMutex);
         if (currentDepth > m_queueDepthMaxWindow) m_queueDepthMaxWindow = currentDepth;
         if (currentDepth > m_queueDepthMaxAll) m_queueDepthMaxAll = currentDepth;
     }
@@ -322,6 +382,9 @@ void StdlibThread::WatchdogCheckAll()
 //----------------------------------------------------------------------------
 void StdlibThread::WatchdogCheck()
 {
+    if (m_startGate.IsHeld())
+        return;     // held at its start gate by design, not hung
+
     auto now = Timer::GetNow();
     auto lastAlive = m_lastAliveTime.load();
     auto watchdogTimeout = m_watchdogTimeout.load();
@@ -372,8 +435,46 @@ void StdlibThread::Process()
     bool selfExit = false;
     t_self_exit = &selfExit;
 
-    // Signal that the thread has started processing to notify CreateThread
-    m_threadStartPromise->set_value();
+    // Exit and idle handlers are copied onto this stack frame so they work on
+    // every return path, including a self-exit where 'this' may already be freed.
+    ThreadExitGuard exitGuard(m_exitHandler);
+    ThreadIdleTimer idle(m_idleHandler, m_idleInterval);
+
+    // Wait for CreateThread() to finish constructing m_thread
+    { std::lock_guard<std::mutex> lock(m_mutex); }
+
+    // dmq::ThisThread::GetCurrent() returns this thread from here on. Declared
+    // after exitGuard, so it is cleared again before the exit handler runs.
+    dmq::CurrentThreadScope currentScope(this);
+
+    if (m_startHandler)
+        m_startHandler();
+
+    // A start handler that exited this thread (ExitThread() on itself) leaves
+    // right after the signal below: once CreateThread() returns, the Thread may
+    // be destroyed, so nothing after the signal may touch 'this'.
+    const bool exitedInStart = selfExit;
+
+    // Signal that the thread has started processing to notify CreateThread.
+    // From a local: the caller may destroy this object once it is signaled.
+    std::promise<void> startPromise = std::move(*m_threadStartPromise);
+    startPromise.set_value();
+    if (exitedInStart) { t_self_exit = nullptr; return; }
+
+    // Optional start gate: wait here, ready but processing nothing, until it opens
+    if (m_startGate.Enabled())
+    {
+        const bool opened = m_startGate.Wait(m_exit);
+        m_lastAliveTime.store(Timer::GetNow());   // before Passed(): no stale watchdog read
+        m_startGate.Passed();
+        if (!opened)
+        {
+            // ExitThread() while held: leave without running any message.
+            // ExitThread() cancels what is still queued once this thread ends.
+            t_self_exit = nullptr;
+            return;
+        }
+    }
 
     while (!selfExit)
     {
@@ -388,18 +489,16 @@ void StdlibThread::Process()
             std::unique_lock<std::mutex> lk(m_mutex);
 
             // Wait for message to be added to the queue.
-            // If watchdog active, use a finite timeout so we can periodically update 
-            // m_lastAliveTime while idle. Otherwise, block forever.
+            // If watchdog active, use a finite timeout so we can periodically update
+            // m_lastAliveTime while idle. If an idle handler is set, wake no later
+            // than when it is due. Otherwise, block forever.
             auto predicate = [this]() { return !(m_highQueue.empty() && m_normalQueue.empty()) || m_exit.load(); };
-            if (watchdogTimeout.count() > 0)
-            {
-                // Wake up frequently to ensure heartbeat is updated while idle
-                m_cv.wait_for(lk, watchdogTimeout / 10, predicate);
-            }
+            // Wake up frequently to ensure heartbeat is updated while idle (negative = forever)
+            dmq::Duration waitTime = idle.WaitTime(watchdogTimeout.count() > 0 ? watchdogTimeout / dmq::WATCHDOG_HEARTBEAT_DIVISOR : dmq::Duration(-1));
+            if (waitTime >= dmq::Duration::zero())
+                m_cv.wait_for(lk, waitTime, predicate);
             else
-            {
                 m_cv.wait(lk, predicate);
-            }
 
             // Always update alive time immediately after waking up
             m_lastAliveTime.store(Timer::GetNow());
@@ -408,23 +507,33 @@ void StdlibThread::Process()
             if ((m_highQueue.empty() && m_normalQueue.empty()))
             {
                 if (m_exit.load()) { t_self_exit = nullptr; return; }
-                continue;
+                if (!idle.IsDue())
+                    continue;
+                // Idle handler is due: fall through with no message
             }
-
-            // Get highest priority message within queue
-            if (!m_highQueue.empty()) {
-                msg = m_highQueue.front();
-                m_highQueue.pop_front();
-            } else {
-                msg = m_normalQueue.front();
-                m_normalQueue.pop_front();
-            }
-
-            // Unblock producers now that space is available
-            if (MAX_QUEUE_SIZE > 0)
+            else
             {
-                m_cvNotFull.notify_one();
+                // Get highest priority message within queue
+                if (!m_highQueue.empty()) {
+                    msg = m_highQueue.front();
+                    m_highQueue.pop_front();
+                } else {
+                    msg = m_normalQueue.front();
+                    m_normalQueue.pop_front();
+                }
+
+                // Unblock producers now that space is available
+                if (MAX_QUEUE_SIZE > 0)
+                {
+                    m_cvNotFull.notify_one();
+                }
             }
+        }
+
+        if (!msg)
+        {
+            idle.Run();
+            continue;
         }
 
         switch (msg->GetId())
@@ -435,7 +544,7 @@ void StdlibThread::Process()
                 // Update latency stats before invoking
                 dmq::Duration latency = Timer::GetNow() - msg->GetEnqueueTime();
                 {
-                    lock_guard<mutex> lock(m_statsMutex);
+                    std::lock_guard<std::mutex> lock(m_statsMutex);
                     m_latencyTotalWindow += latency;
                     m_latencyCountWindow++;
                     if (latency > m_latencyMaxWindow) m_latencyMaxWindow = latency;
@@ -454,31 +563,31 @@ void StdlibThread::Process()
 #if defined(__cpp_exceptions) && !defined(DMQ_ASSERTS)
                         try {
                             bool success = invoker->Invoke(delegateMsg);
-                            if (!selfExit) ASSERT_TRUE(success);
+                            if (!selfExit) DMQ_ASSERT_TRUE(success);
                         }
                         catch (const std::bad_alloc& e) {
                             std::cerr << "[Thread:" << THREAD_NAME << "] Unhandled bad_alloc in delegate callback: " << e.what() << std::endl;
-                            ASSERT();
+                            DMQ_ASSERT();
                         }
                         catch (const std::invalid_argument& e) {
                             std::cerr << "[Thread:" << THREAD_NAME << "] Unhandled invalid_argument in delegate callback: " << e.what() << std::endl;
-                            ASSERT();
+                            DMQ_ASSERT();
                         }
                         catch (const std::runtime_error& e) {
                             std::cerr << "[Thread:" << THREAD_NAME << "] Unhandled runtime_error in delegate callback: " << e.what() << std::endl;
-                            ASSERT();
+                            DMQ_ASSERT();
                         }
                         catch (const std::exception& e) {
                             std::cerr << "[Thread:" << THREAD_NAME << "] Unhandled exception in delegate callback: " << e.what() << std::endl;
-                            ASSERT();
+                            DMQ_ASSERT();
                         }
                         catch (...) {
                             std::cerr << "[Thread:" << THREAD_NAME << "] Unhandled unknown exception in delegate callback." << std::endl;
-                            ASSERT();
+                            DMQ_ASSERT();
                         }
 #else
                         bool success = invoker->Invoke(delegateMsg);
-                        if (!selfExit) ASSERT_TRUE(success);
+                        if (!selfExit) DMQ_ASSERT_TRUE(success);
 #endif
                         if (selfExit) {
                             t_self_exit = nullptr;
@@ -487,7 +596,7 @@ void StdlibThread::Process()
 #if defined(DMQ_DATABUS_TOOLS)
                         dmq::Duration invokeTime = Timer::GetNow() - start;
                         if (!selfExit) {
-                            lock_guard<mutex> lock(m_statsMutex);
+                            std::lock_guard<std::mutex> lock(m_statsMutex);
                             m_invokeTotalWindow += invokeTime;
                             m_invokeCountWindow++;
                             if (invokeTime > m_invokeMaxWindow) m_invokeMaxWindow = invokeTime;
@@ -506,9 +615,13 @@ void StdlibThread::Process()
             }
 
             default:
-                ASSERT();
+                DMQ_ASSERT();
                 break;
         }
+
+        // Any message restarts the idle countdown
+        idle.Restart();
+
         // msg goes out of scope here — may trigger self-destruction of 'this'.
         // After this point do not access any member; check selfExit in while().
     }
@@ -524,7 +637,7 @@ StdlibThread::ThreadStats StdlibThread::SnapshotStats()
     // Need m_mutex only for (m_highQueue.size() + m_normalQueue.size())
     size_t currentDepth = GetQueueSize();
 
-    lock_guard<mutex> lock(m_statsMutex);
+    std::lock_guard<std::mutex> lock(m_statsMutex);
     ThreadStats stats;
     stats.cpu_name = CPU_NAME;
     stats.thread_name = THREAD_NAME;
@@ -568,3 +681,5 @@ StdlibThread::ThreadStats StdlibThread::SnapshotStats()
 #endif
 
 } // namespace dmq::os
+
+#endif // DMQ_THREAD_STDLIB

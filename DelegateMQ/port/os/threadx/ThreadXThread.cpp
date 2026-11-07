@@ -1,18 +1,20 @@
-#ifndef DMQ_THREAD_THREADX
-#error "port/os/threadx/ThreadXThread.cpp requires DMQ_THREAD_THREADX. Remove this file from your build configuration or define DMQ_THREAD_THREADX."
-#endif
+// Compiles to nothing unless DMQ_THREAD_THREADX is selected, so every DelegateMQ source
+// file can be added to a build (see src/DelegateMQ.cpp).
+#include "delegate/DelegateSelect.h"
+#if defined(DMQ_THREAD_THREADX)
 
 #include "DelegateMQ.h"
 #include "ThreadXThread.h"
 #include "port/os/common/ThreadMsg.h"
+#include "port/os/common/ThreadHooks.h"
 #include "extras/util/Fault.h"
 #include <cstdio>
 #include <cstring> // for memset
 #include <new> // for std::nothrow
 
-// Define ASSERT_TRUE if not already defined
-#ifndef ASSERT_TRUE
-#define ASSERT_TRUE(x) if(!(x)) { while(1); } // Replace with your fault handler
+// Define DMQ_ASSERT_TRUE if not already defined
+#ifndef DMQ_ASSERT_TRUE
+#define DMQ_ASSERT_TRUE(x) if(!(x)) { while(1); } // Replace with your fault handler
 #endif
 
 namespace dmq::os {
@@ -35,13 +37,14 @@ ThreadXThread::ThreadXThread(const char* threadName, size_t maxQueueSize, FullPo
     // block in ThreadXDelegateQueue's constructor)
     memset(&m_thread, 0, sizeof(m_thread));
     memset(&m_exitSem, 0, sizeof(m_exitSem));
+    memset(&m_startSem, 0, sizeof(m_startSem));
 
 #if defined(DMQ_DATABUS_TOOLS)
     tx_mutex_create(&m_statMutex, (CHAR*)"StatMutex", TX_NO_INHERIT);
 #endif
 
     // Default Priority
-    m_priority = 10;
+    m_priority = static_cast<UINT>(dmq::THREADX_THREAD_PRIORITY); // DMQ_THREADX_THREAD_PRIORITY
 }
 
 //----------------------------------------------------------------------------
@@ -49,9 +52,19 @@ ThreadXThread::ThreadXThread(const char* threadName, size_t maxQueueSize, FullPo
 //----------------------------------------------------------------------------
 ThreadXThread::~ThreadXThread()
 {
+    // Deleting a ThreadXThread from one of its own callbacks is not supported: the
+    // destructor would free the stack and control block the thread is still
+    // running on, and ThreadX/Zephyr (unlike FreeRTOS, whose idle task frees a
+    // self-deleted task's stack) have no way to free them afterwards. Fault
+    // immediately instead of corrupting memory. To stop a thread from inside
+    // its own callback, call ExitThread() and delete the object from another
+    // thread.
+    if (m_thread.tx_thread_id != 0 && tx_thread_identify() == &m_thread)
+        DMQ_ASSERT();
+
     ExitThread();
 
-    const std::lock_guard<dmq::RecursiveMutex> lock(GetWatchdogLock());
+    const dmq::LockGuard<dmq::RecursiveMutex> lock(GetWatchdogLock());
     ThreadXThread** pp = &GetWatchdogHead();
     while (*pp != nullptr)
     {
@@ -72,6 +85,9 @@ ThreadXThread::~ThreadXThread()
     if (m_exitSem.tx_semaphore_id != 0) {
         tx_semaphore_delete(&m_exitSem);
     }
+    if (m_startSem.tx_semaphore_id != 0) {
+        tx_semaphore_delete(&m_startSem);
+    }
 }
 
 //----------------------------------------------------------------------------
@@ -82,13 +98,32 @@ bool ThreadXThread::CreateThread(std::optional<dmq::Duration> watchdogTimeout)
     // Check if thread is already created (tx_thread_id is non-zero if created)
     if (m_thread.tx_thread_id == 0)
     {
+        // Reset from a previous ExitThread(), so the thread can be created again
+        m_exit.store(false);
+        // Held from creation, so the watchdog never sees a gated thread as hung
+        // before it reaches the gate (e.g. created before the scheduler runs)
+        m_startGate.OnCreate();
+        // Set before the thread exists: its loop reads the timeout before its
+        // first queue wait, and an idle thread waits forever with no timeout
+        m_lastAliveTime.store(Timer::GetNow());
+        m_watchdogTimeout.store(watchdogTimeout.value_or(dmq::Duration(0)));
+        m_discard.store(false);
+
         // 0. Create Synchronization Semaphore (Critical for cleanup)
         if (m_exitSem.tx_semaphore_id == 0) {
             tx_semaphore_create(&m_exitSem, (CHAR*)"ExitSem", 0);
         }
+        if (m_startSem.tx_semaphore_id == 0) {
+            tx_semaphore_create(&m_startSem, (CHAR*)"StartSem", 0);
+        }
+
+        // Called from a thread, CreateThread() waits for the start handler. From
+        // tx_application_define() (no current thread) it cannot block; the start
+        // handler then runs when the kernel starts, still before any message.
+        m_startSync = (tx_thread_identify() != TX_NULL);
 
         // --- 1. Create Queue ---
-        ASSERT_TRUE(m_queue.Create(m_queueSize, THREAD_NAME.c_str()));
+        DMQ_ASSERT_TRUE(m_queue.Create(m_queueSize, THREAD_NAME.c_str()));
 
         // --- 2. Create Thread ---
         // Stack must be ULONG aligned.
@@ -96,8 +131,16 @@ bool ThreadXThread::CreateThread(std::optional<dmq::Duration> watchdogTimeout)
         // Stack Size Rounding
         ULONG stackSizeWords = (STACK_SIZE + sizeof(ULONG) - 1) / sizeof(ULONG);
 
+        // ThreadX requires the caller to supply this memory. It's allocated with
+        // new (std::nothrow) on purpose (the CLAUDE.md "no new" rule allows a
+        // justified exception): the fixed-block allocator is sized for small
+        // objects and has a limited number of size classes
+        // (DMQ_XALLOCATOR_MAX_ALLOCATORS), so multi-KB buffers would exhaust it,
+        // and a ThreadX byte pool would require the application to create one.
+        // Allocated once per CreateThread(), freed by ExitThread()/the destructor.
         m_stackMemory.reset(new (std::nothrow) ULONG[stackSizeWords]);
-        ASSERT_TRUE(m_stackMemory != nullptr);
+        if (!m_stackMemory)
+            BAD_ALLOC();
 
         UINT ret = tx_thread_create(&m_thread,
                                (CHAR*)THREAD_NAME.c_str(),
@@ -114,21 +157,24 @@ bool ThreadXThread::CreateThread(std::optional<dmq::Duration> watchdogTimeout)
             // Register before resuming: the thread must never be able to run
             // (and call Process()) before its registry entry exists.
             {
-                const std::lock_guard<dmq::RecursiveMutex> lock(GetInstanceRegistryLock());
+                const dmq::LockGuard<dmq::RecursiveMutex> lock(GetInstanceRegistryLock());
                 GetInstanceRegistry()[&m_thread] = this;
             }
             tx_thread_resume(&m_thread);
+
+            // Wait for the start handler to complete
+            if (m_startSync)
+                tx_semaphore_get(&m_startSem, TX_WAIT_FOREVER);
         }
 
-        ASSERT_TRUE(ret == TX_SUCCESS);
+        DMQ_ASSERT_TRUE(ret == TX_SUCCESS);
 
         m_lastAliveTime.store(Timer::GetNow());
 
         if (watchdogTimeout.has_value())
         {
-            m_watchdogTimeout = watchdogTimeout.value();
 
-            const std::lock_guard<dmq::RecursiveMutex> lock(GetWatchdogLock());
+            const dmq::LockGuard<dmq::RecursiveMutex> lock(GetWatchdogLock());
 
             // Add to watchdog registry if not already present
             bool found = false;
@@ -178,11 +224,18 @@ UINT ThreadXThread::GetThreadPriority()
 //----------------------------------------------------------------------------
 // ExitThread
 //----------------------------------------------------------------------------
-void ThreadXThread::ExitThread()
+void ThreadXThread::ExitThread(ExitPolicy policy)
 {
     if (m_queue.IsCreated())
     {
+        // Set before m_exit: Run() reads it for every message ahead of the exit message
+        m_discard.store(policy == ExitPolicy::DISCARD);
         m_exit.store(true);
+
+        // A thread held at its start gate isn't waiting on its queue: wake it so it
+        // sees the exit flag (set above) and leaves. Never touches the gate itself,
+        // which may be destroyed once the thread is released.
+        m_startGate.Wake();
 
         // Determine self-exit BEFORE attempting to enqueue the exit message.
         // If this thread is destroying itself from within its own dispatched
@@ -192,11 +245,40 @@ void ThreadXThread::ExitThread()
         // to be queued in that case: Run()'s dispatch loop already checks
         // m_selfExitPtr immediately after the current callback invoke
         // returns, and unwinds without touching 'this' again.
+        //
+        // A self-exiting thread must also NOT do the cleanup below: it is still
+        // running on m_stackMemory with m_thread linked in the kernel, so
+        // deleting the queue, wiping m_thread or freeing the stack here would
+        // corrupt ThreadX state. Set the flags and return; the cleanup runs in a
+        // later ExitThread() from another thread (typically ~ThreadXThread()),
+        // which sees m_selfExited and waits for the thread to finish instead of
+        // doing the exit-message handshake. Same approach as ZephyrThread.
         TX_THREAD* currentThread = tx_thread_identify();
         bool isSelfExit = (currentThread == &m_thread);
 
         if (isSelfExit) {
-            if (m_selfExitPtr) *m_selfExitPtr = true;
+            m_selfExited.store(true);
+            if (m_selfExitPtr) { *m_selfExitPtr = true; m_selfExitPtr = nullptr; }
+            m_startGate.Leave();     // exited from its start handler: never reaches the gate
+            // Self-exit: this thread runs no more messages, and the object may be
+            // destroyed once this handler returns. Stop watchdog checks now.
+            m_watchdogTimeout.store(dmq::Duration(0));
+            return;
+        }
+
+        if (m_selfExited.load()) {
+            // The thread self-exited earlier and is returning (or has returned)
+            // from Run() on its own, possibly still running its exit handler.
+            // Wait until ThreadX marks it finished before terminating/deleting
+            // it below. Not from an ISR: there it can't block, as above.
+            if (currentThread != nullptr) {
+                UINT state = TX_READY;
+                while (tx_thread_info_get(&m_thread, nullptr, &state, nullptr, nullptr, nullptr,
+                                          nullptr, nullptr, nullptr) == TX_SUCCESS
+                       && state != TX_COMPLETED && state != TX_TERMINATED) {
+                    tx_thread_sleep(1);
+                }
+            }
         } else {
             // Send exit message
             ThreadMsg* msg = new (std::nothrow) ThreadMsg(MSG_EXIT_THREAD);
@@ -214,12 +296,17 @@ void ThreadXThread::ExitThread()
                 // Wait for Run() to signal completion
                 tx_semaphore_get(&m_exitSem, TX_WAIT_FOREVER);
             }
-
-            // Force terminate if still running (safety net)
-            // tx_thread_terminate returns TX_SUCCESS if terminated or TX_THREAD_ERROR if already terminated
-            tx_thread_terminate(&m_thread);
-            tx_thread_delete(&m_thread);
         }
+
+        // Force terminate if still running (safety net)
+        // tx_thread_terminate returns TX_SUCCESS if terminated or TX_THREAD_ERROR if already terminated
+        // The thread has finished (or, on a self-exit, is in its last handler):
+        // stop watchdog checks. Not earlier, so a thread that hangs while
+        // ExitThread() waits for it is still reported.
+        m_watchdogTimeout.store(dmq::Duration(0));
+
+        tx_thread_terminate(&m_thread);
+        tx_thread_delete(&m_thread);
 
         m_queue.DrainAndDelete();
         m_queue.Destroy();
@@ -227,12 +314,13 @@ void ThreadXThread::ExitThread()
         // Remove the registry entry before clearing/reusing the control block
         // (see GetInstanceRegistry() for why this exists).
         {
-            const std::lock_guard<dmq::RecursiveMutex> lock(GetInstanceRegistryLock());
+            const dmq::LockGuard<dmq::RecursiveMutex> lock(GetInstanceRegistryLock());
             GetInstanceRegistry().erase(&m_thread);
         }
 
         // Clear control block so CreateThread could potentially be called again
         memset(&m_thread, 0, sizeof(m_thread));
+        m_selfExited.store(false);
     }
 }
 
@@ -307,9 +395,14 @@ bool ThreadXThread::DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg)
     {
         if (FULL_POLICY == FullPolicy::FAULT) {
             printf("[Thread] CRITICAL: Queue full on thread '%s'! TRIGGERING FAULT.\n", THREAD_NAME.c_str());
-            ASSERT_TRUE(sent);
+            DMQ_ASSERT_TRUE(sent);
         } else if (FULL_POLICY == FullPolicy::TIMEOUT) {
             printf("[Thread] WARNING: Queue post timed out on '%s' — possible deadlock. Message dropped.\n", THREAD_NAME.c_str());
+            if (m_droppedHandler)
+                m_droppedHandler(GetQueueSize());
+        } else { // DROP
+            if (m_droppedHandler)
+                m_droppedHandler(GetQueueSize());
         }
         delete threadMsg; // Failed to enqueue, prevent leak
         return false;
@@ -334,13 +427,13 @@ void ThreadXThread::Process(ULONG /*instance*/)
 {
     ThreadXThread* thread = nullptr;
     {
-        const std::lock_guard<dmq::RecursiveMutex> lock(GetInstanceRegistryLock());
+        const dmq::LockGuard<dmq::RecursiveMutex> lock(GetInstanceRegistryLock());
         auto it = GetInstanceRegistry().find(tx_thread_identify());
         if (it != GetInstanceRegistry().end())
             thread = it->second;
     }
 
-    ASSERT_TRUE(thread != nullptr);
+    DMQ_ASSERT_TRUE(thread != nullptr);
     thread->Run();
 }
 
@@ -349,6 +442,9 @@ void ThreadXThread::Process(ULONG /*instance*/)
 //----------------------------------------------------------------------------
 void ThreadXThread::WatchdogCheck()
 {
+    if (m_startGate.IsHeld())
+        return;     // held at its start gate by design, not hung
+
     auto now = Timer::GetNow();
     auto lastAlive = m_lastAliveTime.load();
     auto watchdogTimeout = m_watchdogTimeout.load();
@@ -376,7 +472,7 @@ void ThreadXThread::ThreadCheck()
 //----------------------------------------------------------------------------
 void ThreadXThread::WatchdogCheckAll()
 {
-    const std::lock_guard<dmq::RecursiveMutex> lock(GetWatchdogLock());
+    const dmq::LockGuard<dmq::RecursiveMutex> lock(GetWatchdogLock());
     ThreadXThread* p = GetWatchdogHead();
     while (p != nullptr)
     {
@@ -429,8 +525,46 @@ void ThreadXThread::Run()
     bool selfExit = false;
     m_selfExitPtr = &selfExit;
 
+    // Exit and idle handlers are copied onto this stack frame so they work on
+    // every return path, including a self-exit where 'this' may already be freed.
+    ThreadExitGuard exitGuard(m_exitHandler);
+    ThreadIdleTimer idle(m_idleHandler, m_idleInterval);
+
+    // dmq::ThisThread::GetCurrent() returns this thread from here on. Reset
+    // before the exit handler runs (and destroyed before exitGuard on a
+    // self-exit), so the exit handler sees nullptr.
+    std::optional<dmq::CurrentThreadScope> currentScope;
+    currentScope.emplace(this);
+
+    if (m_startHandler)
+        m_startHandler();
+
+    // A start handler that exited this thread (ExitThread() on itself) leaves
+    // right after the signal below: once CreateThread() returns, the Thread may
+    // be destroyed, so nothing after the signal may touch 'this'.
+    const bool exitedInStart = selfExit;
+
+    if (m_startSync)
+        tx_semaphore_put(&m_startSem);
+    if (exitedInStart)
+        return;
+
+    // Optional start gate: wait here, ready but processing nothing, until it opens
+    if (m_startGate.Enabled())
+    {
+        const bool opened = m_startGate.Wait(m_exit);
+        m_lastAliveTime.store(Timer::GetNow());   // before Passed(): no stale watchdog read
+        m_startGate.Passed();
+        // ExitThread() while held: run nothing. Cancel each queued message
+        // (DISCARD) until the exit message. Consuming them also keeps
+        // ExitThread()'s blocking send of the exit message from waiting on a
+        // full queue.
+        if (!opened)
+            m_discard.store(true);
+    }
+
     ThreadMsg* msg = nullptr;
-    while (!selfExit && !m_exit.load())
+    while (!selfExit)
     {
         dmq::Duration timeout;
         {
@@ -439,20 +573,48 @@ void ThreadXThread::Run()
         }
 
         // If watchdog active, use a finite timeout so we can periodically update 
-        // m_lastAliveTime while idle. Otherwise, block forever to save power.
+        // m_lastAliveTime while idle. If an idle handler is set, wake no later
+        // than when it is due. Otherwise, block forever to save power.
         ULONG waitOption = TX_WAIT_FOREVER;
         if (timeout.count() > 0)
         {
             auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(timeout).count();
-            waitOption = (static_cast<ULONG>(ms / 4) * TX_TIMER_TICKS_PER_SECOND) / 1000;
+            waitOption = (static_cast<ULONG>(ms / dmq::WATCHDOG_HEARTBEAT_DIVISOR) * TX_TIMER_TICKS_PER_SECOND) / 1000;
             if (waitOption == 0) waitOption = 1;
+        }
+        if (idle.Enabled())
+        {
+            auto ms = std::chrono::ceil<std::chrono::milliseconds>(idle.WaitTime(dmq::Duration(-1))).count();
+            ULONG idleTicks = (static_cast<ULONG>(ms) * TX_TIMER_TICKS_PER_SECOND + 999) / 1000;
+            if (idleTicks < waitOption) waitOption = idleTicks;
         }
 
         msg = m_queue.Receive(waitOption);
-        if (!msg) continue; // Timeout or other failure
+        if (!msg)
+        {
+            // Exit requested but no exit message arrived (e.g. it could not be allocated)
+            if (m_exit.load())
+                break;
+
+            // Timeout or other failure: run the idle handler if it is due
+            if (idle.IsDue())
+            {
+                idle.Run();
+                // The idle handler exited this thread (and may have deleted it): leave
+                // without touching 'this', as the message path does
+                if (selfExit)
+                    return;
+            }
+            continue;
+        }
 
         int msgId = msg->GetId();
-        if (msgId == MSG_DISPATCH_DELEGATE)
+        if (msgId == MSG_DISPATCH_DELEGATE && m_discard.load())
+        {
+            // ExitPolicy::DISCARD: skip messages queued ahead of the exit message
+            CancelThreadMsg(*msg);
+        }
+        else if (msgId == MSG_DISPATCH_DELEGATE)
         {
 #if defined(DMQ_DATABUS_TOOLS)
             // Update latency stats before invoking
@@ -469,9 +631,9 @@ void ThreadXThread::Run()
 #endif
 
             auto delegateMsg = msg->GetData();
-            ASSERT_TRUE(delegateMsg);
+            DMQ_ASSERT_TRUE(delegateMsg);
             auto invoker = delegateMsg->GetInvoker();
-            ASSERT_TRUE(invoker);
+            DMQ_ASSERT_TRUE(invoker);
 
 #if defined(DMQ_DATABUS_TOOLS)
             dmq::TimePoint start = Timer::GetNow();
@@ -480,35 +642,34 @@ void ThreadXThread::Run()
             bool success = false;
             try {
                 success = invoker->Invoke(delegateMsg);
-                ASSERT_TRUE(success);
+                if (!selfExit) DMQ_ASSERT_TRUE(success);
             }
             catch (const std::bad_alloc& e) {
                 std::cerr << "[Thread:" << THREAD_NAME << "] Unhandled bad_alloc in delegate callback: " << e.what() << std::endl;
-                ASSERT();
+                DMQ_ASSERT();
             }
             catch (const std::invalid_argument& e) {
                 std::cerr << "[Thread:" << THREAD_NAME << "] Unhandled invalid_argument in delegate callback: " << e.what() << std::endl;
-                ASSERT();
+                DMQ_ASSERT();
             }
             catch (const std::runtime_error& e) {
                 std::cerr << "[Thread:" << THREAD_NAME << "] Unhandled runtime_error in delegate callback: " << e.what() << std::endl;
-                ASSERT();
+                DMQ_ASSERT();
             }
             catch (const std::exception& e) {
                 printf("[Thread:%s] Unhandled exception in delegate callback: %s\n", THREAD_NAME.c_str(), e.what());
-                ASSERT();
+                DMQ_ASSERT();
             }
             catch (...) {
                 printf("[Thread:%s] Unhandled unknown exception in delegate callback.\n", THREAD_NAME.c_str());
-                ASSERT();
+                DMQ_ASSERT();
             }
 #else
             bool success = invoker->Invoke(delegateMsg);
-            if (!selfExit) ASSERT_TRUE(success);
+            if (!selfExit) DMQ_ASSERT_TRUE(success);
 #endif
             if (selfExit) {
                 delete msg;
-                m_selfExitPtr = nullptr;
                 return;
             }
 
@@ -530,11 +691,19 @@ void ThreadXThread::Run()
         if (msgId == MSG_EXIT_THREAD) {
             break;
         }
+
+        // Any message restarts the idle countdown
+        idle.Restart();
     }
 
+    // Run the exit handler before signalling ExitThread(), so it returns only after it
+    currentScope.reset();
+    exitGuard.Fire();
+
+    // Clear before signalling: once ExitThread() returns, 'this' may be destroyed
+    m_selfExitPtr = nullptr;
     // Signal ExitThread() that the loop has exited
     tx_semaphore_put(&m_exitSem);
-    m_selfExitPtr = nullptr;
 }
 
 #if defined(DMQ_DATABUS_TOOLS)
@@ -588,3 +757,5 @@ ThreadXThread::ThreadStats ThreadXThread::SnapshotStats()
 #endif
 
 } // namespace dmq::os
+
+#endif // DMQ_THREAD_THREADX

@@ -1,8 +1,15 @@
+// ThreadMonitor publishes per-thread stats gathered by Thread::SnapshotStats(),
+// which only exists when DMQ_DATABUS_TOOLS is enabled (desktop default; off on
+// embedded DataBus builds -- see DelegateSelect.h). Otherwise this file
+// compiles to nothing, so it can stay in a build that adds every DelegateMQ
+// source file (see src/DelegateMQ.cpp).
+#include "delegate/DelegateSelect.h"
+#if defined(DMQ_HAS_THREADING) && defined(DMQ_DATABUS) && defined(DMQ_DATABUS_TOOLS)
+
 #include "ThreadMonitor.h"
 #include "DelegateMQ.h"
 
-#if defined(DMQ_DATABUS)
-
+#include <array>
 #include <chrono>
 
 namespace dmq::util {
@@ -22,7 +29,7 @@ void ThreadMonitor::Register(dmq::os::Thread* thread) {
     if (instance.m_threadCount < dmq::MAX_WATCHDOG_THREADS)
         instance.m_threads[instance.m_threadCount++] = thread;
     else
-        ASSERT();
+        DMQ_ASSERT();
 }
 
 void ThreadMonitor::Deregister(dmq::os::Thread* thread) {
@@ -69,7 +76,7 @@ void ThreadMonitor::Disable() {
 void ThreadMonitor::MonitorLoop() {
     if (!m_enabled) return;
 
-    dmq::os::Thread::ThreadStats snapshots[dmq::MAX_WATCHDOG_THREADS];
+    std::array<dmq::os::Thread::ThreadStats, dmq::MAX_WATCHDOG_THREADS> snapshots;
     size_t snapshotCount = 0;
     {
         dmq::LockGuard<dmq::Mutex> lock(m_mutex);
@@ -114,4 +121,4 @@ void ThreadMonitor::MonitorLoop() {
 
 } // namespace dmq::util
 
-#endif // DMQ_DATABUS
+#endif // DMQ_DATABUS && DMQ_DATABUS_TOOLS

@@ -1,3 +1,8 @@
+// Compiles to nothing unless DMQ_ALLOCATOR is selected, so every DelegateMQ source
+// file can be added to a build (see src/DelegateMQ.cpp).
+#include "delegate/DelegateSelect.h"
+#if defined(DMQ_ALLOCATOR)
+
 #include "Allocator.h"
 #include "delegate/DelegateOpt.h"
 #include <new>
@@ -62,7 +67,7 @@ Allocator::~Allocator()
 //------------------------------------------------------------------------------
 void* Allocator::Allocate([[maybe_unused]] size_t size)
 {
-    ASSERT_TRUE(size <= m_objectSize);
+    DMQ_ASSERT_TRUE(size <= m_objectSize);
 	
     // If can't obtain existing block then get a new one
     void* pBlock = Pop();
@@ -118,15 +123,19 @@ void* Allocator::Allocate([[maybe_unused]] size_t size)
 //------------------------------------------------------------------------------
 void Allocator::Deallocate(void* pBlock)
 {
+	// delete of a null pointer may call operator delete(NULL) (DECLARE_ALLOCATOR)
+	if (!pBlock)
+		return;
+
 #ifdef DMQ_ALLOCATOR_SAFEGUARDS
 	if (m_allocatorMode == STATIC_POOL || m_allocatorMode == HEAP_POOL)
 	{
 		// Check that pBlock is within the pool range
 		char* pCharBlock = (char*)pBlock;
-		ASSERT_TRUE(pCharBlock >= m_pPool && pCharBlock < (m_pPool + (m_blockSize * m_maxObjects)));
+		DMQ_ASSERT_TRUE(pCharBlock >= m_pPool && pCharBlock < (m_pPool + (m_blockSize * m_maxObjects)));
 
 		// Check that pBlock is aligned on a block boundary
-		ASSERT_TRUE(((size_t)(pCharBlock - m_pPool) % m_blockSize) == 0);
+		DMQ_ASSERT_TRUE(((size_t)(pCharBlock - m_pPool) % m_blockSize) == 0);
 	}
 #endif
 
@@ -173,7 +182,4 @@ void* Allocator::Pop()
 
 } // namespace dmq
 
-
-
-
-
+#endif // DMQ_ALLOCATOR

@@ -9,6 +9,7 @@
 #include "extras/dispatcher/RemoteChannel.h"
 #include "extras/util/Fault.h"
 #include <algorithm>
+#include <array>
 #include <string>
 #include <memory>
 #include <typeindex>
@@ -37,8 +38,24 @@ public:
     // are a data race on the channel's internal stream buffer.
     void SetSendThread(dmq::IThread* thread) { m_sendThread = thread; }
 
-    // Add a remote topic mapping.
-    // When local DataBus publishes to 'topic', it will be sent to this participant using 'remoteId'.
+    /// @brief How long a received sequence number counts toward duplicate
+    /// detection. Defaults to dmq::SEQ_HISTORY_EXPIRY (DMQ_SEQ_HISTORY_EXPIRY_MS).
+    /// Set it to cover the sender's retry window if that differs from the default.
+    void SetSeqHistoryExpiry(dmq::Duration expiry) {
+        dmq::LockGuard<dmq::RecursiveMutex> lock(m_mutex);
+        m_seqHistoryExpiry = expiry;
+    }
+
+    /// @brief Map a topic string to a remote ID for outbound sends to this
+    /// participant.
+    /// @details When local `DataBus::Publish()` sends to `topic`, it is
+    /// serialized and sent to this participant using `remoteId` on the wire.
+    /// Required for the sending side of remote distribution — see
+    /// `docs/DATABUS.md`'s "Setup Checklist".
+    /// @param topic     Topic string to map.
+    /// @param remoteId  Wire identifier this topic is sent as. Must match the
+    ///                  ID the receiving node registers via
+    ///                  `DataBus::AddIncomingTopic<T>()` for the same topic.
     void AddRemoteTopic(const dmq::xstring& topic, dmq::DelegateRemoteId remoteId) {
         dmq::LockGuard<dmq::RecursiveMutex> lock(m_mutex);
         m_topicToRemoteId[topic] = remoteId;
@@ -71,13 +88,20 @@ public:
         }
 
         if (result == 0) {
-            // Validate header marker
-            if (header.GetMarker() != dmq::transport::DmqHeader::MARKER) {
+            // Validate header marker and protocol version
+            if (!header.IsValid()) {
+                OnChannelError(dmq::INVALID_REMOTE_ID, dmq::DelegateError::ERR_TRANSPORT_RECEIVE, 0);
                 return -1; // Protocol error
             }
 
             dmq::DelegateRemoteId id = header.GetId();
             uint16_t seqNum = header.GetSeqNum();
+
+            // An ACK was already handled inside the transport (it cleared the
+            // pending entry in the transport monitor). It has no channel, so
+            // it isn't an ERR_NO_DISPATCHER.
+            if (id == dmq::ACK_REMOTE_ID)
+                return 0;
 
             dmq::IRemoteInvoker* invoker = nullptr;
             std::shared_ptr<void> channelLifetime; // keeps channel alive across lock gap
@@ -86,7 +110,8 @@ public:
                 auto it = m_channels.find(id);
                 if (it != m_channels.end()) {
                     // Filter out duplicate messages (retries)
-                    if (id != dmq::ACK_REMOTE_ID && m_history[id].is_duplicate(seqNum)) {
+                    if (id != dmq::ACK_REMOTE_ID &&
+                        m_history[HistoryKey(header.GetNodeId(), id)].is_duplicate(seqNum, dmq::Clock::now(), m_seqHistoryExpiry)) {
                         return 0; // Silently drop duplicate
                     }
                     channelLifetime = it->second.channel;
@@ -129,15 +154,17 @@ public:
 
         if (typeMismatch) {
             OnChannelError(remoteId, dmq::DelegateError::ERR_TYPE_MISMATCH, 0);
-            ASSERT();
+            DMQ_ASSERT();
             return true;
         }
 
         if (channel) {
             if (m_sendThread) {
-                // Use a member function to avoid potential shared_ptr circular 
-                // references. Pass arguments to AsyncInvoke.
-                (void)dmq::MakeDelegate(this, &Participant::AsyncSend<T>, *m_sendThread).AsyncInvoke(channel, data);
+                // Static function, not a lambda (no capture to allocate) and not
+                // a member (the queued message must not hold a raw `this`; the
+                // Participant may be destroyed before the send thread runs it).
+                // The channel shared_ptr keeps the channel alive until then.
+                (void)dmq::MakeDelegate(&Participant::AsyncSend<T>, *m_sendThread).AsyncInvoke(channel, data);
             } else {
                 (*channel)(data);
             }
@@ -151,16 +178,28 @@ public:
     }
 
     /// @brief Internal helper to execute a remote send on a background thread.
-    /// @details Using a member function prevents potential shared_ptr circular 
-    /// references.
+    /// @details Static so the queued message holds no `this`: the channel
+    /// shared_ptr is all it needs, and the Participant may be gone by then.
     template <typename T>
-    void AsyncSend(std::shared_ptr<dmq::RemoteChannel<void(T)>> channel, T data) {
+    static void AsyncSend(std::shared_ptr<dmq::RemoteChannel<void(T)>> channel, T data) {
         if (channel) {
             (*channel)(data);
         }
     }
 
-    // Register a local handler for a remote topic using a `std::function`.
+    /// @brief Register a local handler invoked when data arrives from this
+    /// participant for `remoteId`, using a `std::function`.
+    /// @details Required for the receiving side of remote distribution — see
+    /// `docs/DATABUS.md`'s "Setup Checklist". Creates the participant's
+    /// `RemoteChannel<void(T)>` for `remoteId` if one doesn't already exist.
+    /// @tparam T          Message type this handler expects. Must match the
+    ///                    type the sending node publishes as `remoteId`, or
+    ///                    this reports ERR_TYPE_MISMATCH via
+    ///                    `Participant::SubscribeError`/`DataBus::SubscribeError`
+    ///                    and asserts.
+    /// @param remoteId    Wire identifier to handle incoming data for.
+    /// @param serializer  Deserializes the incoming wire bytes into a `T`.
+    /// @param func        Called with each deserialized `T`.
     template <typename T>
     void RegisterHandler(dmq::DelegateRemoteId remoteId, dmq::ISerializer<void(T)>& serializer, std::function<void(T)> func) {
         bool typeMismatch = false;
@@ -174,11 +213,24 @@ public:
         }
         if (typeMismatch) {
             OnChannelError(remoteId, dmq::DelegateError::ERR_TYPE_MISMATCH, 0);
-            ASSERT();
+            DMQ_ASSERT();
         }
     }
 
-    // Register a local handler for a remote topic using a raw lambda or functor.
+    /// @brief Register a local handler invoked when data arrives from this
+    /// participant for `remoteId`, using a raw lambda or functor.
+    /// @details Same behavior as the `std::function` overload above, just
+    /// without the `std::function` wrapping overhead for a plain callable.
+    /// @tparam T          Message type this handler expects. Must match the
+    ///                    type the sending node publishes as `remoteId`, or
+    ///                    this reports ERR_TYPE_MISMATCH via
+    ///                    `Participant::SubscribeError`/`DataBus::SubscribeError`
+    ///                    and asserts.
+    /// @tparam F          Callable type, deduced from `func`. Must be invocable
+    ///                    as `void(T)`.
+    /// @param remoteId    Wire identifier to handle incoming data for.
+    /// @param serializer  Deserializes the incoming wire bytes into a `T`.
+    /// @param func        Called with each deserialized `T`.
     template <typename T, typename F, typename = std::enable_if_t<dmq::trait::is_callable<F>::value>>
     void RegisterHandler(dmq::DelegateRemoteId remoteId, dmq::ISerializer<void(T)>& serializer, F&& func) {
         bool typeMismatch = false;
@@ -192,7 +244,7 @@ public:
         }
         if (typeMismatch) {
             OnChannelError(remoteId, dmq::DelegateError::ERR_TYPE_MISMATCH, 0);
-            ASSERT();
+            DMQ_ASSERT();
         }
     }
 
@@ -311,6 +363,7 @@ private:
 
     dmq::transport::ITransport* m_transport;
     dmq::IThread* m_sendThread = nullptr;
+    dmq::Duration m_seqHistoryExpiry = dmq::SEQ_HISTORY_EXPIRY;
     bool m_continuousErrors = false;
     dmq::RecursiveMutex m_mutex;
     dmq::Mutex m_receiveMutex;
@@ -321,25 +374,45 @@ private:
     dmq::Signal<void(const dmq::xstring&, dmq::DelegateError)> m_errorSignal;
 
     // --- Duplicate Filtering ---
+    // Retries reuse the original sequence number, so a recently seen number from
+    // the same sender and remote ID is a duplicate. Sequence numbers are per
+    // sender, so history is kept per (sender node ID, remote ID); senders that
+    // leave their node ID unset (0) share one history per remote ID.
+    // Entries expire after m_seqHistoryExpiry, which covers the sender's whole
+    // retry window: an older match is a restarted sender reusing the number,
+    // not a retry.
+    static uint32_t HistoryKey(uint8_t nodeId, dmq::DelegateRemoteId id) {
+        return (static_cast<uint32_t>(nodeId) << 16) | id;
+    }
+
     struct SeqHistory {
         static constexpr size_t SIZE = DMQ_SEQ_HISTORY_SIZE;
-        uint16_t buffer[SIZE];
-        bool valid[SIZE];
+        std::array<uint16_t, SIZE> buffer;
+        std::array<dmq::TimePoint, SIZE> received;
+        std::array<bool, SIZE> valid;
         size_t head = 0;
 
-        SeqHistory() { std::fill(valid, valid + SIZE, false); }
+        SeqHistory() { valid.fill(false); }
 
-        bool is_duplicate(uint16_t seq) {
+        bool is_duplicate(uint16_t seq, dmq::TimePoint now, dmq::Duration expiry) {
             for (size_t i = 0; i < SIZE; ++i) {
-                if (valid[i] && buffer[i] == seq) return true;
+                if (valid[i] && buffer[i] == seq) {
+                    if (now - received[i] < expiry)
+                        return true;
+                    // Expired: a new message reusing the number. Refresh this
+                    // slot rather than take a second one for the same number.
+                    received[i] = now;
+                    return false;
+                }
             }
             buffer[head] = seq;
+            received[head] = now;
             valid[head] = true;
             head = (head + 1) % SIZE;
             return false;
         }
     };
-    dmq::xmap<dmq::DelegateRemoteId, SeqHistory> m_history;
+    dmq::xmap<uint32_t, SeqHistory> m_history;
 };
 
 } // namespace dmq::databus

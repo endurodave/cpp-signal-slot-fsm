@@ -14,21 +14,30 @@
 /// asynchronous delegates and system messages.
 ///
 /// **Key Features:**
-/// * **Priority Queue:** Uses `std::priority_queue` to ensure high-priority delegate
-///   messages (e.g., system signals) are processed before lower-priority ones.
-/// * **Queue Full Policy:** Configurable `FullPolicy` (DROP, FAULT, or TIMEOUT) when `maxQueueSize > 0`.
-///   TIMEOUT waits up to `dispatchTimeout` for the consumer before logging and dropping;
-///   DROP silently discards immediately. FAULT (the default) triggers a system fault.
+/// * **Priority Queue:** One FIFO `std::deque` per priority level, so high-priority
+///   delegate messages (e.g., system signals) are processed before normal ones, and
+///   messages of the same priority are processed in the order they were dispatched.
+/// * **Queue Full Policy:** Configurable `FullPolicy` (DROP, FAULT, or TIMEOUT), always enforced --
+///   `maxQueueSize == 0` falls back to `dmq::THREAD_DESKTOP_QUEUE_SIZE` rather than disabling
+///   the cap, since this port backs its queue with a plain `std::deque` and would otherwise
+///   grow without bound if the destination thread is dead/stuck. TIMEOUT waits up to
+///   `dispatchTimeout` for the consumer before logging and dropping; DROP silently discards
+///   immediately. FAULT (the default) triggers a system fault.
 /// * **Watchdog Integration:** Includes a built-in heartbeat mechanism. If the thread loop
 ///   stalls (deadlock or infinite loop), the watchdog timer detects the failure.
 /// * **Synchronized Start:** Uses a Win32 manual-reset event to ensure the thread
 ///   is fully initialized and running before `CreateThread()` returns.
 /// * **Debug Support:** Sets the native thread name via `SetThreadDescription()` to
 ///   aid debugging in Visual Studio.
+/// * **Start Gate:** Optional `SetStartGate(StartGate*)`, called before `CreateThread()`,
+///   holds the thread ready but processing no messages, at any priority, until
+///   `StartGate::Open()` releases every thread sharing the gate at once.
 
 #include "delegate/IThread.h"
+#include "delegate/UnicastDelegate.h"
 #include "./extras/util/Timer.h"
 #include "port/os/common/ThreadMsg.h"
+#include "port/os/common/StartGate.h"
 #include <deque>
 #include <atomic>
 #include <optional>
@@ -46,6 +55,9 @@ namespace dmq::os {
 /// @brief Policy applied when the thread message queue is full. See dmq::FullPolicy
 /// in DelegateOpt.h for the canonical definition, shared by every dmq::os::Thread port.
 using FullPolicy = dmq::FullPolicy;
+
+/// @brief What ExitThread() does with queued messages. See dmq::ExitPolicy in DelegateOpt.h.
+using ExitPolicy = dmq::ExitPolicy;
 
 /// @brief Windows-native thread for systems using the Win32 API.
 /// @details The Win32Thread class creates a worker thread capable of dispatching and
@@ -76,9 +88,10 @@ public:
     /// Constructor
     /// @param threadName The name of the thread for debugging.
     /// @param maxQueueSize The maximum number of messages allowed in the queue.
-    ///                     0 means unlimited (no back pressure).
+    ///                     0 falls back to dmq::THREAD_DESKTOP_QUEUE_SIZE -- a high-water-mark
+    ///                     safety net, not a throughput limiter, against unbounded growth if
+    ///                     the destination thread is dead/stuck.
     /// @param fullPolicy When the queue is full: FAULT (default), DROP, or TIMEOUT.
-    ///                   Only meaningful when maxQueueSize > 0.
     /// @param dispatchTimeout Duration to wait before giving up when policy is TIMEOUT.
     /// @param cpuName Optional CPU/Core name grouping for monitoring tools.
     Win32Thread(const char* threadName, size_t maxQueueSize = 0, FullPolicy fullPolicy = FullPolicy::FAULT,
@@ -97,8 +110,12 @@ public:
     /// @return TRUE if thread is created. FALSE otherwise.
     bool CreateThread(std::optional<dmq::Duration> watchdogTimeout = std::nullopt);
 
-    /// Called once at program exit to shut down the worker thread
-    void ExitThread();
+    /// Shut down the worker thread.
+    /// @param[in] policy - DRAIN (default) invokes every message queued before this
+    ///   call first; DISCARD invokes only the message already running and cancels
+    ///   the rest (see dmq::ExitPolicy). Called from the thread's own message
+    ///   handler (a self-exit), queued messages are always discarded.
+    void ExitThread(ExitPolicy policy = ExitPolicy::DRAIN);
 
     /// Get the ID of this thread instance
     DWORD GetThreadId();
@@ -124,6 +141,67 @@ public:
     /// arguments.
     virtual bool DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg) override;
 
+    /// @brief Register a handler invoked when DispatchDelegate() drops a message:
+    /// under FullPolicy::DROP (queue full, discarded immediately) or
+    /// FullPolicy::TIMEOUT (queue stayed full for dispatchTimeout, discarded).
+    /// Optional; unset by default. Called synchronously on the calling (producer)
+    /// thread, with the queue depth at the time of the drop.
+    void SetDroppedHandler(const dmq::UnicastDelegate<void(size_t)>& handler) { m_droppedHandler = handler; }
+    void SetDroppedHandler(dmq::UnicastDelegate<void(size_t)>&& handler) { m_droppedHandler = std::move(handler); }
+
+    /// @brief Register a handler invoked on the worker thread before it processes
+    /// any message. Use it for per-thread setup (COM, a language runtime attach,
+    /// thread-local state, affinity). CreateThread() returns only after it completes.
+    /// @details Must be called while the thread is not running (before CreateThread(),
+    /// or after ExitThread()); calling it on a running thread faults. It runs again
+    /// on each CreateThread(). Messages dispatched meanwhile are queued, not lost.
+    void SetStartHandler(const dmq::UnicastDelegate<void()>& handler) { DMQ_ASSERT_TRUE(m_hThread == NULL); m_startHandler = handler; }
+    void SetStartHandler(dmq::UnicastDelegate<void()>&& handler) { DMQ_ASSERT_TRUE(m_hThread == NULL); m_startHandler = std::move(handler); }
+
+    /// @brief Optional: hold this thread at `gate` once it is created, until
+    /// `gate->Open()`. Pass nullptr (the default) to start at once.
+    /// @details CreateThread() still runs the start handler and returns when the
+    /// thread is ready; the thread then processes nothing, at any priority, until
+    /// the gate opens. Use one gate for a group of threads so they all start
+    /// together after setup. See port/os/common/StartGate.h. Must be called while
+    /// the thread is not running; calling it on a running thread faults.
+    void SetStartGate(StartGate* gate) { DMQ_ASSERT_TRUE(m_hThread == NULL); m_startGate.Set(gate); }
+
+    /// @brief Register a handler invoked on the worker thread after it processes
+    /// its last message, as the thread exits. Use it to undo SetStartHandler() setup.
+    /// @details Must be called while the thread is not running; calling it on a
+    /// running thread faults. The handler is copied when the thread starts.
+    /// ExitThread() from another thread returns after it completes. If the thread
+    /// exits itself (ExitThread() from a handler on this thread), it runs after the
+    /// owning Win32Thread may already be destroyed, so it must not touch that object.
+    void SetExitHandler(const dmq::UnicastDelegate<void()>& handler) { DMQ_ASSERT_TRUE(m_hThread == NULL); m_exitHandler = handler; }
+    void SetExitHandler(dmq::UnicastDelegate<void()>&& handler) { DMQ_ASSERT_TRUE(m_hThread == NULL); m_exitHandler = std::move(handler); }
+
+    /// @brief Register a handler invoked on the worker thread when its queue has
+    /// been empty for `interval`, then again every `interval` while it stays empty.
+    /// Any message processed restarts the countdown. Use it for background work that
+    /// should yield to messages: polling, housekeeping, entering low power.
+    /// @details Must be called while the thread is not running; calling it on a
+    /// running thread faults. The handler and interval are copied when the thread
+    /// starts. Not called once ExitThread() has been requested.
+    /// @param[in] handler - the idle handler, or an empty delegate to disable.
+    /// @param[in] interval - quiet time before each call. Must be greater than zero.
+    ///                       Defaults to dmq::THREAD_IDLE_INTERVAL (DMQ_THREAD_IDLE_INTERVAL).
+    void SetIdleHandler(const dmq::UnicastDelegate<void()>& handler, dmq::Duration interval = dmq::THREAD_IDLE_INTERVAL)
+    {
+        DMQ_ASSERT_TRUE(m_hThread == NULL);
+        DMQ_ASSERT_TRUE(interval > dmq::Duration::zero());
+        m_idleHandler = handler;
+        m_idleInterval = interval;
+    }
+    void SetIdleHandler(dmq::UnicastDelegate<void()>&& handler, dmq::Duration interval = dmq::THREAD_IDLE_INTERVAL)
+    {
+        DMQ_ASSERT_TRUE(m_hThread == NULL);
+        DMQ_ASSERT_TRUE(interval > dmq::Duration::zero());
+        m_idleHandler = std::move(handler);
+        m_idleInterval = interval;
+    }
+
     /// @brief Manually update the watchdog alive timestamp.
     /// @details The Run() loop refreshes the timestamp automatically on every iteration.
     /// Call this from inside long-running message handlers to prevent a false watchdog
@@ -148,10 +226,8 @@ private:
     /// Entry point for the thread
     void Process();
 
-    /// Check watchdog is expired. This function is called by the thread
-    /// that calls dmq::util::Timer::ProcessTimers(). This function is thread-safe.
-    /// In a real-time OS, dmq::util::Timer::ProcessTimers() typically is called by the highest
-    /// priority task in the system.
+    /// Check watchdog is expired. Called by WatchdogCheckAll(), which the application
+    /// calls periodically, typically from its highest-priority task. Thread-safe.
     void WatchdogCheck();
 
     /// Get registry head using the "Immortal" Pattern
@@ -189,12 +265,25 @@ private:
     // Timeout duration for TIMEOUT policy
     const dmq::Duration m_dispatchTimeout;
 
+    // Optional handler invoked when a message is dropped (FullPolicy::DROP or TIMEOUT)
+    dmq::UnicastDelegate<void(size_t)> m_droppedHandler;
+
+    // Optional handlers invoked on the worker thread at start, exit and when idle
+    dmq::UnicastDelegate<void()> m_startHandler;
+    dmq::UnicastDelegate<void()> m_exitHandler;
+    dmq::UnicastDelegate<void()> m_idleHandler;
+    dmq::Duration m_idleInterval = dmq::Duration::zero();
+
     std::atomic<bool> m_exit;
 
     // Watchdog related members
-    std::atomic<dmq::TimePoint> m_lastAliveTime;
-    std::atomic<dmq::Duration> m_watchdogTimeout;
+    std::atomic<dmq::TimePoint> m_lastAliveTime{dmq::TimePoint()};
+    std::atomic<dmq::Duration> m_watchdogTimeout{dmq::Duration(0)};
     Win32Thread* m_watchdogNext = nullptr;
+
+    // Optional start gate (SetStartGate()): its state, and whether the thread is
+    // held at it (the watchdog doesn't report a thread waiting by design)
+    StartGateClient m_startGate;
 
 #if defined(DMQ_DATABUS_TOOLS)
     // Monitoring statistics members

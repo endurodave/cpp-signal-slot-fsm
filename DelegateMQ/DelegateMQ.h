@@ -84,10 +84,12 @@
 // Valid for any platform where a Mutex is defined in DelegateOpt.h
 #if defined(DMQ_THREAD_STDLIB) || \
     defined(DMQ_THREAD_WIN32) || \
+    defined(DMQ_THREAD_POSIX) || \
     defined(DMQ_THREAD_FREERTOS) || \
     defined(DMQ_THREAD_THREADX) || \
     defined(DMQ_THREAD_ZEPHYR) || \
     defined(DMQ_THREAD_CMSIS_RTOS2) || \
+    defined(DMQ_THREAD_NUTTX) || \
     defined(DMQ_THREAD_QT) || \
     defined(DMQ_THREAD_NONE)
     #include "delegate/MulticastDelegateSafe.h"
@@ -103,10 +105,12 @@
 // Valid for any platform that implements the IThread interface
 #if defined(DMQ_THREAD_STDLIB) || \
     defined(DMQ_THREAD_WIN32) || \
+    defined(DMQ_THREAD_POSIX) || \
     defined(DMQ_THREAD_FREERTOS) || \
     defined(DMQ_THREAD_THREADX) || \
     defined(DMQ_THREAD_ZEPHYR) || \
     defined(DMQ_THREAD_CMSIS_RTOS2) || \
+    defined(DMQ_THREAD_NUTTX) || \
     defined(DMQ_THREAD_QT)
     #include "delegate/DelegateAsync.h"
 #endif
@@ -114,7 +118,7 @@
 // -----------------------------------------------------------------------------
 // 4. Asynchronous "Blocking" Delegates (Wait for Result)
 // -----------------------------------------------------------------------------
-// Depends on Semaphore/Mutex and C++17 (std::any, std::optional).
+// Depends on Semaphore/Mutex and C++17 (std::optional).
 // Valid for StdLib/Win32 (Windows/Linux), Qt, ThreadX, FreeRTOS (if C++17
 // enabled), Zephyr, and CMSIS-RTOS2 -- the latter two via their native
 // k_sem/osSemaphore-backed dmq::Semaphore, not the generic condvar+mutex
@@ -131,6 +135,9 @@
 #elif defined(DMQ_THREAD_WIN32)
     #include "port/os/win32/Win32Thread.h"
     #include "port/os/common/ThreadMsg.h"
+#elif defined(DMQ_THREAD_POSIX)
+    #include "port/os/posix/PosixThread.h"
+    #include "port/os/common/ThreadMsg.h"
 #elif defined(DMQ_THREAD_FREERTOS)
     #include "port/os/freertos/FreeRTOSThread.h"
     #include "port/os/common/ThreadMsg.h"
@@ -143,6 +150,9 @@
 #elif defined(DMQ_THREAD_CMSIS_RTOS2)
     #include "port/os/cmsis-rtos2/CmsisRtos2Thread.h"
     #include "port/os/common/ThreadMsg.h"
+#elif defined(DMQ_THREAD_NUTTX)
+    #include "port/os/nuttx/NuttXThread.h"
+    #include "port/os/common/ThreadMsg.h"
 #elif defined(DMQ_THREAD_QT)
     #include "port/os/qt/QtThread.h"
     #include "port/os/common/ThreadMsg.h"
@@ -154,15 +164,15 @@
 #endif
 
 #if defined(DMQ_SERIALIZE_MSGPACK)
-    #include "port/serialize/msgpack/Serializer.h"
+    #include "port/serialize/msgpack/MsgpackSerializer.h"
 #elif defined(DMQ_SERIALIZE_CEREAL)
-    #include "port/serialize/cereal/Serializer.h"
+    #include "port/serialize/cereal/CerealSerializer.h"
 #elif defined(DMQ_SERIALIZE_BITSERY)
-    #include "port/serialize/bitsery/Serializer.h"
+    #include "port/serialize/bitsery/BitserySerializer.h"
 #elif defined(DMQ_SERIALIZE_RAPIDJSON)
-    #include "port/serialize/rapidjson/Serializer.h"
+    #include "port/serialize/rapidjson/RapidJsonSerializer.h"
 #elif defined(DMQ_SERIALIZE_SERIALIZE)
-    #include "port/serialize/serialize/Serializer.h"
+    #include "port/serialize/serialize/DmqSerializer.h"
 #elif defined(DMQ_SERIALIZE_NONE)
     // Create a custom application-specific serializer
 #else
@@ -189,6 +199,9 @@
     #include "extras/dispatcher/Dispatcher.h"
     #include "port/transport/linux-udp/LinuxUdpTransport.h"
     #include "port/transport/linux-udp/MulticastTransport.h"
+#elif defined(DMQ_TRANSPORT_LINUX_UDS)
+    #include "extras/dispatcher/Dispatcher.h"
+    #include "port/transport/linux-uds/LinuxUdsTransport.h"
 #elif defined(DMQ_TRANSPORT_LINUX_TCP)
     #include "extras/dispatcher/Dispatcher.h"
     #include "port/transport/linux-tcp/LinuxTcpTransport.h"
@@ -229,7 +242,8 @@
 #if defined(DMQ_TRANSPORT_ZEROMQ) || defined(DMQ_TRANSPORT_NNG) || \
     defined(DMQ_TRANSPORT_WIN32_PIPE) || defined(DMQ_TRANSPORT_WIN32_UDP) || \
     defined(DMQ_TRANSPORT_WIN32_TCP) || defined(DMQ_TRANSPORT_LINUX_UDP) || \
-    defined(DMQ_TRANSPORT_LINUX_TCP) || defined(DMQ_TRANSPORT_MQTT) || \
+    defined(DMQ_TRANSPORT_LINUX_TCP) || defined(DMQ_TRANSPORT_LINUX_UDS) || \
+    defined(DMQ_TRANSPORT_MQTT) || \
     defined(DMQ_TRANSPORT_SERIAL_PORT) || defined(DMQ_TRANSPORT_ARM_LWIP_UDP) || \
     defined(DMQ_TRANSPORT_ARM_LWIP_NETCONN_UDP) || defined(DMQ_TRANSPORT_THREADX_UDP) || \
     defined(DMQ_TRANSPORT_STM32_UART) || defined(DMQ_TRANSPORT_ZEPHYR_UDP) || \
@@ -240,20 +254,37 @@
 #include "extras/util/Fault.h"
 #include "extras/util/ClockHelper.h"
 
-// Only include Timer and AsyncInvoke if threads exist
+// Timer only needs dmq::Clock/dmq::CriticalSection (both of which the
+// bare-metal port -- BareMetalClock.h/BareMetalCriticalSection.h -- provides
+// specifically so Timer::ProcessTimers() can be driven from a hardware ISR
+// with no RTOS at all, e.g. a SysTick_Handler; see BareMetalCriticalSection.h's
+// own doc comment). It has no dependency on dmq::os::Thread, so it's
+// available even under DMQ_THREAD_NONE.
+#include "extras/util/Timer.h"
+
+// TimerDelegate/AsyncInvoke/TransportMonitor/ThreadMonitor/RetryMonitor/
+// ReliableTransport/RemoteDispatcher all take or operate on a dmq::IThread&
+// (RetryMonitor/ReliableTransport indirectly, via TransportMonitor), which
+// doesn't exist under DMQ_THREAD_NONE.
+// RetryMonitor/ReliableTransport are listed explicitly here as first-class
+// extras/util components usable directly with Participant/DataBus, independent
+// of RemoteDispatcher -- the old NetworkEngine used to pull both in as a side
+// effect of its own per-transport #include block, which any DelegateMQ.h
+// consumer (not just RPC users) could end up silently depending on. That
+// implicit path is gone now that RemoteDispatcher itself no longer knows about
+// ReliableTransport (only RetryMonitor, for AttachRetryMonitor()'s signature),
+// so both are pulled in explicitly instead. RemoteDispatcher itself no longer
+// depends on which transport (if any) is selected -- it only ever sees
+// dmq::transport::ITransport -- so unlike the old NetworkEngine it needs no
+// DMQ_TRANSPORT_* guard here.
 #if !defined(DMQ_THREAD_NONE)
-    #include "extras/util/Timer.h"
     #include "extras/util/TimerDelegate.h"
     #include "extras/util/AsyncInvoke.h"
     #include "extras/util/TransportMonitor.h"
     #include "extras/util/ThreadMonitor.h"
-#endif
-
-// Only include NetworkEngine if a transport that uses it is active
-#if defined(DMQ_TRANSPORT_ZEROMQ) || defined(DMQ_TRANSPORT_WIN32_UDP) || \
-    defined(DMQ_TRANSPORT_LINUX_UDP) || defined(DMQ_TRANSPORT_STM32_UART) || \
-    defined(DMQ_TRANSPORT_SERIAL_PORT)
-    #include "extras/util/NetworkEngine.h"
+    #include "extras/util/RetryMonitor.h"
+    #include "extras/util/ReliableTransport.h"
+    #include "extras/rpc/RemoteDispatcher.h"
 #endif
 
 #if defined(DMQ_DATABUS)

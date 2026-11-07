@@ -1,11 +1,11 @@
 #include "Timer.h"
 #include "Fault.h"
+#include <array>
 #include <chrono>
 #include <algorithm>
 
 namespace dmq::util {
 
-using namespace std;
 
 std::atomic<bool> Timer::m_timerStopped{false};
 
@@ -23,8 +23,11 @@ Timer::Timer()
 //------------------------------------------------------------------------------
 Timer::~Timer()
 {
+    // Wait out a ProcessTimers() that found this timer expired and hasn't
+    // copied its subscribers yet (see GetProcessLock()).
+    const dmq::LockGuard<dmq::RecursiveMutex> processLock(GetProcessLock());
     const dmq::LockGuard<dmq::CriticalSection> lock(GetLock());
-    
+
     // Remove 'this' from the intrusive linked list
     Timer** pp = &GetTimersHead();
     while (*pp != nullptr)
@@ -47,7 +50,7 @@ void Timer::Start(dmq::Duration timeout, bool once)
     if (timeout <= dmq::Duration(0)) {
 #if !defined(__cpp_exceptions) || defined(DMQ_ASSERTS)
         // Use the macro from Fault.h to halt the system
-        ASSERT();
+        DMQ_ASSERT();
         return;
 #else
         throw std::invalid_argument("Timeout cannot be 0");
@@ -124,10 +127,13 @@ bool Timer::CheckExpired()
 
         // Check if we are still behind (timer starvation)
         // If the new deadline is STILL in the past, we are falling behind.
-        if (GetNow() > m_expireTime)
+        const dmq::TimePoint now = GetNow();
+        if (now > m_expireTime)
         {
-            // The timer has fallen behind so set time expiration further forward.
-            m_expireTime = GetNow();
+            // The timer has fallen behind. Skip the missed periods and expire one
+            // full period from now; expiring at `now` would fire again on the
+            // very next ProcessTimers() call.
+            m_expireTime = now + m_timeout;
 
             // Timer processing is falling behind. Maybe user timer expiration is too 
             // short, time processing takings too long, or CheckExpired not called 
@@ -143,64 +149,94 @@ bool Timer::CheckExpired()
 // ProcessTimers
 //------------------------------------------------------------------------------
 void Timer::ProcessTimers()
-{   
-    dmq::Signal<void()>::Snapshot snapshots[dmq::MAX_TIMER_EXPIRED];
-    size_t count = 0;
+{
+    // Drains all expired timers across multiple passes so a single call always
+    // fully clears the backlog, regardless of how many timers expired in the
+    // same tick — mirrors TransportMonitor::Process()'s identical "batch cap
+    // exceeded mid-drain" handling for the same MAX_TIMER_EXPIRED-sized batch.
+    size_t count;
 
-    {
-        const dmq::LockGuard<dmq::CriticalSection> lock(GetLock());
+    do {
+        std::array<dmq::Signal<void()>::Snapshot, dmq::MAX_TIMER_EXPIRED> snapshots;
+        count = 0;
+        size_t remaining = 0;
 
-        // Remove disabled timer from the list if stopped
-        if (m_timerStopped)
         {
-            Timer** pp = &GetTimersHead();
-            while (*pp != nullptr)
+            // Held until every timer found expired below has had its subscribers
+            // copied. ~Timer() takes it too, so none of those timers can be
+            // destroyed in between.
+            const dmq::LockGuard<dmq::RecursiveMutex> processLock(GetProcessLock());
+
+            std::array<Timer*, dmq::MAX_TIMER_EXPIRED> expired;
             {
-                if (!((*pp)->m_enabled))
+                const dmq::LockGuard<dmq::CriticalSection> lock(GetLock());
+
+                // Remove disabled timer from the list if stopped
+                if (m_timerStopped)
                 {
-                    Timer* next = (*pp)->m_next;
-                    (*pp)->m_next = nullptr;
-                    *pp = next;
+                    Timer** pp = &GetTimersHead();
+                    while (*pp != nullptr)
+                    {
+                        if (!((*pp)->m_enabled))
+                        {
+                            Timer* next = (*pp)->m_next;
+                            (*pp)->m_next = nullptr;
+                            *pp = next;
+                        }
+                        else
+                        {
+                            pp = &((*pp)->m_next);
+                        }
+                    }
+                    m_timerStopped = false;
                 }
-                else
+
+                // Identify expired timers while holding the lock.
+                Timer* t = GetTimersHead();
+                while (t != nullptr)
                 {
-                    pp = &((*pp)->m_next);
+                    if (count >= dmq::MAX_TIMER_EXPIRED) {
+                        // Batch is full for this pass. Deliberately do NOT call
+                        // CheckExpired() on the remaining timers here — that would
+                        // mutate their expiry state (advance m_expireTime / disable
+                        // a one-shot) without capturing a snapshot, permanently
+                        // dropping that expiration. Leaving them untouched lets the
+                        // next pass process them correctly.
+                        Timer* rem = t;
+                        while (rem != nullptr) { ++remaining; rem = rem->m_next; }
+                        break;
+                    }
+
+                    if (t->CheckExpired())
+                        expired[count++] = t;
+                    t = t->m_next;
                 }
             }
-            m_timerStopped = false;
+
+            // Copy each expired timer's subscribers outside the critical section:
+            // GetSnapshot() takes the signal's OS mutexes and can allocate, neither
+            // of which is allowed with interrupts masked.
+            for (size_t i = 0; i < count; ++i)
+                snapshots[i] = expired[i]->OnExpired.GetSnapshot();
         }
 
-        // Identify expired timers while holding the lock.
-        // NOTE: Snapshots are captured under the lock to ensure the Timer
-        // object is valid. The actual invocation happens outside the lock.
-        Timer* t = GetTimersHead();
-        while (t != nullptr)
+        // Call the client's expired callback functions outside the lock.
+        // This allows callbacks to perform thread-safe operations (like DataBus::Publish)
+        // without risking a deadlock with the global timer lock.
+        // The Snapshot holds shared_ptrs to the delegates, so even if a Timer
+        // was deleted on another thread after the lock was released, the
+        // callback targets remain valid.
+        for (size_t i = 0; i < count; ++i)
         {
-            if (count >= dmq::MAX_TIMER_EXPIRED) {
-                LOG_ERROR("Timer::ProcessTimers MAX_TIMER_EXPIRED exceeded");
-                ASSERT_TRUE(count < dmq::MAX_TIMER_EXPIRED);
-                break;
-            }
-
-            if (t->CheckExpired())
-            {
-                snapshots[count++] = t->OnExpired.GetSnapshot();
-            }
-            t = t->m_next;
+            dmq::Signal<void()>::InvokeSnapshot(snapshots[i]);
+            snapshots[i] = {};  // release shared_ptr refs so delegates aren't held between calls
         }
-    }
 
-    // Call the client's expired callback functions outside the lock.
-    // This allows callbacks to perform thread-safe operations (like DataBus::Publish)
-    // without risking a deadlock with the global timer lock.
-    // The Snapshot holds shared_ptrs to the delegates, so even if a Timer 
-    // was deleted on another thread after the lock was released, the 
-    // callback targets remain valid.
-    for (size_t i = 0; i < count; ++i)
-    {
-        dmq::Signal<void()>::InvokeSnapshot(snapshots[i]);
-        snapshots[i] = {};  // release shared_ptr refs so delegates aren't held between calls
-    }
+        if (remaining > 0) {
+            LOG_ERROR("Timer::ProcessTimers: batch cap reached, {} timers remain — continuing drain.", remaining);
+        }
+
+    } while (count == dmq::MAX_TIMER_EXPIRED);
 }
 
 //------------------------------------------------------------------------------

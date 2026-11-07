@@ -1,6 +1,29 @@
 #ifndef DMQ_DATABUS_H
 #define DMQ_DATABUS_H
 
+/// @file
+/// @brief Publish/subscribe message bus built on top of DelegateMQ's Signal
+/// and remote delegate infrastructure. Routes typed topics to local
+/// subscribers and, via Participant, to remote nodes.
+///
+/// @details
+/// `DataBus` is a process-wide singleton: components publish and subscribe by
+/// topic string rather than holding direct references to each other. A topic's
+/// C++ type is fixed by its first use and enforced afterward (see
+/// `DataBus::SubscribeError`'s `ERR_TYPE_MISMATCH`).
+///
+/// @code
+///   auto conn = dmq::databus::DataBus::Subscribe<TemperatureMsg>(
+///       "sensor/temperature",
+///       [](const TemperatureMsg& msg) { /* handle it */ });
+///
+///   dmq::databus::DataBus::Publish("sensor/temperature", msg);
+/// @endcode
+///
+/// To span multiple processes/machines, see `NetworkNode` (this directory)
+/// or manually wire a `Participant` — either way, see `docs/DATABUS.md` for
+/// the full guide and `extras/databus/README.md` for a quickstart.
+
 #include "delegate/Signal.h"
 #include "delegate/DelegateRemote.h"
 #include "delegate/DelegateAsync.h"
@@ -67,6 +90,41 @@ namespace detail {
         dmq::UnicastDelegate<bool(const T&)> m_predicate;
     };
 
+    // Holds an async subscriber's delegate for the life of its subscription.
+    //
+    // An async subscription is connected as a DelegateMemberAsync holding a
+    // shared_ptr to this holder. Every publish clones that delegate to queue the
+    // call; the clone copies only the shared_ptr. The subscriber used to be
+    // wrapped in a std::function (DelegateFunctionAsync) instead, and each clone
+    // then copied the std::function. libstdc++ (and libc++) keep a callable
+    // inline only if it's trivially copyable, which UnicastDelegate isn't, so on
+    // GCC/Clang toolchains every publish to an async subscriber made a global
+    // heap allocation outside DMQ_ALLOCATOR. MSVC kept it inline, which hid it.
+    //
+    // The holder is allocated once per subscription (xmake_shared). Every clone
+    // runs on the subscriber's own thread, so calls through it are sequential.
+    template <typename Arg>
+    class AsyncSubscriber {
+        XALLOCATOR
+    public:
+        explicit AsyncSubscriber(dmq::UnicastDelegate<void(const Arg&)> func)
+            : m_func(std::move(func)) {}
+
+        void Invoke(const Arg& data) { m_func(data); }
+
+    private:
+        dmq::UnicastDelegate<void(const Arg&)> m_func;
+    };
+
+    // Build the async delegate for a subscriber on `thread` (see AsyncSubscriber).
+    template <typename Arg>
+    dmq::DelegateMemberAsync<AsyncSubscriber<Arg>, void(const Arg&)>
+    MakeAsyncSubscriber(dmq::UnicastDelegate<void(const Arg&)> func, dmq::IThread& thread) {
+        auto holder = dmq::xmake_shared<AsyncSubscriber<Arg>>(std::move(func));
+        return dmq::DelegateMemberAsync<AsyncSubscriber<Arg>, void(const Arg&)>(
+            holder, &AsyncSubscriber<Arg>::Invoke, thread);
+    }
+
 }
 
 // The DataBus is a central registry for topic-based communication.
@@ -77,9 +135,31 @@ namespace detail {
 // the DataBus instance or its Reset() calls.
 class DataBus {
 public:
-    // Subscribe to a topic with optional QoS and thread dispatching.
-    // NOTE: Signal connection is established before LVC delivery to ensure 
-    // no messages are missed.
+    /// @brief Subscribe to a topic, with optional thread dispatch and QoS.
+    /// @tparam T     Message type published to this topic. Must match the type
+    ///               used by every other Publish/Subscribe/RegisterSerializer
+    ///               call on the same topic string, or DataBus::SubscribeError
+    ///               reports ERR_TYPE_MISMATCH.
+    /// @tparam F     Callable type — a lambda, function pointer, member delegate,
+    ///               or UnicastDelegate<void(const T&)>. Deduced from `func`.
+    /// @param topic  Topic string to subscribe to.
+    /// @param func   Called with each delivered T. Accepts any callable matching
+    ///               void(const T&).
+    /// @param thread Optional. If non-null, `func` is dispatched asynchronously
+    ///               on this thread instead of firing synchronously on the
+    ///               publisher's thread.
+    /// @param qos    Optional quality-of-service settings (e.g. last-value
+    ///               cache, rate limiting). Defaults to no special behavior.
+    /// @return A ScopedConnection owning the subscription. [[nodiscard]] —
+    ///         letting it go out of scope immediately unsubscribes with no
+    ///         callbacks ever firing. Store it in a member variable or
+    ///         container for as long as the subscription should stay active.
+    /// @note Signal connection is established before LVC delivery to ensure
+    /// no messages are missed.
+    /// @note Unsubscribing does not wait for a delivery already in progress on
+    /// a publisher's thread, and a message already queued on `thread` still
+    /// runs. If `func` captures an object, guard its lifetime before destroying
+    /// it right after unsubscribing (see the note in Signal.h).
     template <typename T, typename F>
     [[nodiscard]] static dmq::ScopedConnection Subscribe(const dmq::xstring& topic, F&& func, dmq::IThread* thread = nullptr, QoS qos = {}) {
         dmq::UnicastDelegate<void(const T&)> typedFunc;
@@ -90,7 +170,39 @@ public:
         return GetInstance().InternalSubscribe<T>(topic, std::move(typedFunc), thread, qos);
     }
 
-    // Subscribe to a topic with a filter.
+    /// @brief Subscribe to a topic, but only receive deliveries for which
+    /// `predicate` returns true — messages that fail the predicate are
+    /// dropped before reaching `func`, without disconnecting the subscription.
+    /// @tparam T         Message type published to this topic. Must match the
+    ///                   type used by every other Publish/Subscribe/
+    ///                   RegisterSerializer call on the same topic string, or
+    ///                   DataBus::SubscribeError reports ERR_TYPE_MISMATCH.
+    /// @tparam F         Callable type for `func` — a lambda, function pointer,
+    ///                   member delegate, or UnicastDelegate<void(const T&)>.
+    ///                   Deduced from `func`.
+    /// @tparam P         Callable type for `predicate` — a lambda, function
+    ///                   pointer, member delegate, or
+    ///                   UnicastDelegate<bool(const T&)>. Deduced from
+    ///                   `predicate`.
+    /// @param topic      Topic string to subscribe to.
+    /// @param func       Called with each delivered T for which `predicate`
+    ///                   returned true. Accepts any callable matching
+    ///                   void(const T&).
+    /// @param predicate  Evaluated for every delivery on this topic, before
+    ///                   `func`. Accepts any callable matching
+    ///                   bool(const T&); returning false silently skips that
+    ///                   delivery.
+    /// @param thread     Optional. `predicate` and `func` are evaluated
+    ///                   together as one unit: with no `thread`, both run
+    ///                   synchronously on the publisher's thread; with a
+    ///                   `thread`, both are dispatched there together instead.
+    /// @param qos        Optional quality-of-service settings (e.g. last-value
+    ///                   cache, rate limiting). Defaults to no special
+    ///                   behavior.
+    /// @return A ScopedConnection owning the subscription. [[nodiscard]] —
+    ///         letting it go out of scope immediately unsubscribes with no
+    ///         callbacks ever firing. Store it in a member variable or
+    ///         container for as long as the subscription should stay active.
     template <typename T, typename F, typename P>
     [[nodiscard]] static dmq::ScopedConnection SubscribeFilter(const dmq::xstring& topic, F&& func, P&& predicate, dmq::IThread* thread = nullptr, QoS qos = {}) {
         dmq::UnicastDelegate<void(const T&)> funcUD;
@@ -106,19 +218,34 @@ public:
             predUD = dmq::DelegateFunction<bool(const T&)>(std::forward<P>(predicate));
 
         auto filter = dmq::xmake_shared<detail::Filter<T>>(std::move(funcUD), std::move(predUD));
-        // Capture filter by shared_ptr so the Filter stays alive for the connection's lifetime.
-        return GetInstance().InternalSubscribe<T>(topic, dmq::DelegateFunction<void(const T&)>([filter](const T& data) { filter->Invoke(data); }), thread, qos);
+        // DelegateMember holds the shared_ptr strongly, so the Filter lives as long as the
+        // connection. No lambda: wrapping one that captures a shared_ptr in a std::function
+        // heap-allocates on GCC/Clang (not trivially copyable), see detail::AsyncSubscriber.
+        return GetInstance().InternalSubscribe<T>(topic,
+            dmq::DelegateMember<detail::Filter<T>, void(const T&)>(std::move(filter), &detail::Filter<T>::Invoke),
+            thread, qos);
     }
 
-    // Publish data to a topic.
+    /// @brief Publish data to a topic — delivered to every local subscriber
+    /// (synchronously, or asynchronously if they registered with a thread),
+    /// then forwarded to any remote participants interested in this topic.
+    /// @tparam T     Message type. Must match every other Publish/Subscribe/
+    ///               RegisterSerializer call on this topic string.
+    /// @param topic  Topic string to publish to.
+    /// @param data   The message payload, copied to each subscriber/participant.
     template <typename T>
     static void Publish(const dmq::xstring& topic, const T& data) {
         GetInstance().InternalPublish<T>(topic, data, false);
     }
 
-    // Publish data to local subscribers only — does NOT forward to remote participants.
-    // Used by AddIncomingTopic to prevent relay loops when a topic is both incoming
-    // and outgoing on the same node.
+    /// @brief Publish data to local subscribers only — does NOT forward to
+    /// remote participants.
+    /// @tparam T     Message type. Must match every other Publish/Subscribe/
+    ///               RegisterSerializer call on this topic string.
+    /// @param topic  Topic string to publish to.
+    /// @param data   The message payload, copied to each local subscriber.
+    /// @note Used by AddIncomingTopic to prevent relay loops when a topic is
+    /// both incoming and outgoing on the same node.
     template <typename T>
     static void PublishLocal(const dmq::xstring& topic, const T& data) {
         GetInstance().InternalPublish<T>(topic, data, true);
@@ -168,6 +295,12 @@ public:
     // AND all registered remote participants (full Publish). Use this only on bridge/relay nodes
     // where the explicit intent is to forward incoming data to other remote nodes.
     //
+    // The relay forwards only to participants that already list the topic as outgoing
+    // (AddRemoteTopic on the downstream participants, plus RegisterSerializer). The inbound
+    // participant is NOT made outgoing for the topic, so on a duplex link (one participant
+    // that both receives and is registered with AddParticipant) relayed data is not echoed
+    // back out the link it arrived on.
+    //
     // WARNING: Using AddRelayTopic on a node that also has the same topic as an outgoing
     // (RegisterSerializer + AddParticipant) AND receives from a node that also relays will
     // create an infinite relay loop. Use AddIncomingTopic instead for subscriber-only nodes.
@@ -176,7 +309,6 @@ public:
         participant.RegisterHandler(remoteId, serializer, [topic](const T& data) {
             Publish(topic, data);
         });
-        participant.AddRemoteTopic(topic, remoteId);
     }
 
     // Register a stringifier for a topic to enable spying/logging.
@@ -200,7 +332,7 @@ public:
     // priority without a thread is a programming error and triggers FaultHandler.
     template <typename F>
     [[nodiscard]] static dmq::ScopedConnection Monitor(F&& func, dmq::IThread* thread = nullptr, dmq::Priority priority = dmq::Priority::NORMAL) {
-        ASSERT_TRUE(thread || priority == dmq::Priority::NORMAL);
+        DMQ_ASSERT_TRUE(thread || priority == dmq::Priority::NORMAL);
 
         dmq::UnicastDelegate<void(const SpyPacket&)> ud;
         if constexpr (std::is_base_of_v<dmq::Delegate<void(const SpyPacket&)>, std::decay_t<F>>)
@@ -213,7 +345,7 @@ public:
         // Establish connection OUTSIDE the global DataBus lock to prevent
         // lock inversion deadlocks. Signal::Connect() is already thread-safe.
         if (thread) {
-            auto del = dmq::MakeDelegate(std::function<void(const SpyPacket&)>(std::move(ud)), *thread);
+            auto del = detail::MakeAsyncSubscriber<SpyPacket>(std::move(ud), *thread);  // see detail::AsyncSubscriber
             del.SetPriority(priority);
             return instance.m_monitorSignal.Connect(std::move(del));
         } else {
@@ -315,9 +447,11 @@ private:
         if (qos.minSeparation.has_value()) {
             auto minSepRep = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(qos.minSeparation.value()).count());
             auto limiter = dmq::xmake_shared<detail::RateLimiter<T>>(std::move(typedFunc), minSepRep);
-            // Capture limiter by shared_ptr so the RateLimiter stays alive for the connection's lifetime.
-            // MakeDelegate(limiter.get(), ...) would store a raw pointer; the shared_ptr must be in the closure.
-            typedFunc = dmq::DelegateFunction<void(const T&)>([limiter](const T& data) { limiter->Invoke(data); });
+            // DelegateMember holds the shared_ptr strongly (not MakeDelegate(limiter.get(), ...),
+            // which would store a raw pointer), so the RateLimiter lives as long as the
+            // connection. No lambda/std::function, as for the Filter above.
+            typedFunc = dmq::DelegateMember<detail::RateLimiter<T>, void(const T&)>(
+                std::move(limiter), &detail::RateLimiter<T>::Invoke);
         }
 
         T* cachedValPtr = nullptr;
@@ -340,7 +474,7 @@ private:
             // Type mismatch: report through the error signal for diagnosability,
             // then hard fault (wrong type is an invariant violation).
             InternalReportLatchedError(topic, dmq::DelegateError::ERR_TYPE_MISMATCH);
-            ASSERT();
+            DMQ_ASSERT();
             return {};
         }
 
@@ -349,10 +483,11 @@ private:
         // DataBus lock and acquiring the Signal lock. However, both use RecursiveMutex
         // and InternalPublish also snapshots signals outside its lock, so this is
         // architecturally consistent with the "lock-free dispatch" pattern used elsewhere.
-        using AsyncDelType = dmq::DelegateFunctionAsync<void(const T&)>;
+        using AsyncDelType = dmq::DelegateMemberAsync<detail::AsyncSubscriber<T>, void(const T&)>;
         std::optional<AsyncDelType> asyncDel;
         if (thread) {
-            asyncDel.emplace(dmq::MakeDelegate(std::function<void(const T&)>(std::move(typedFunc)), *thread));
+            // No std::function here: see detail::AsyncSubscriber.
+            asyncDel.emplace(detail::MakeAsyncSubscriber<T>(std::move(typedFunc), *thread));
             conn = signal->Connect(*asyncDel);
         } else {
             conn = signal->Connect(typedFunc);
@@ -467,7 +602,7 @@ private:
                                 // Recovery copy also failed: the slot cannot be safely
                                 // restored to a valid state. This is an unrecoverable
                                 // invariant violation, not a normal operational error.
-                                ASSERT();
+                                DMQ_ASSERT();
                             }
                             throw;
                         }
@@ -504,7 +639,7 @@ private:
 
         if (typeMismatch) {
             InternalReportLatchedError(topic, dmq::DelegateError::ERR_TYPE_MISMATCH);
-            ASSERT();
+            DMQ_ASSERT();
             return;
         }
 
@@ -568,7 +703,15 @@ private:
             dmq::MakeDelegate(this, &DataBus::InternalReportLatchedError));
 
         dmq::LockGuard<dmq::RecursiveMutex> lock(m_mutex);
-        ASSERT_TRUE(m_participantCount < dmq::MAX_PARTICIPANTS);
+        if (m_participantCount >= dmq::MAX_PARTICIPANTS) {
+            // Report via the error signal for diagnosability, then hard fault —
+            // same "report, then fault" hybrid as the ERR_TYPE_MISMATCH sites
+            // above. Recursive mutex allows re-entry into InternalReportLatchedError
+            // while m_mutex is already held.
+            InternalReportLatchedError("<AddParticipant>", dmq::DelegateError::ERR_CAPACITY_EXCEEDED);
+            DMQ_ASSERT();
+            return;
+        }
         m_participantErrorConnections[m_participantCount] = std::move(conn);
         participant->EnableContinuousErrors(m_continuousErrors);
         m_participants[m_participantCount++] = participant;
@@ -586,7 +729,7 @@ private:
         }
         if (typeMismatch) {
             InternalReportLatchedError(topic, dmq::DelegateError::ERR_TYPE_MISMATCH);
-            ASSERT();
+            DMQ_ASSERT();
         }
     }
 
@@ -609,7 +752,7 @@ private:
         }
         if (typeMismatch) {
             InternalReportLatchedError(topic, dmq::DelegateError::ERR_TYPE_MISMATCH);
-            ASSERT();
+            DMQ_ASSERT();
         }
     }
 
@@ -679,7 +822,7 @@ private:
 
     // Look up topic's registered type; if none yet, establish it as `expected`.
     // Returns true if topic was already registered with a DIFFERENT type -- a
-    // programming-error type mismatch the caller must report/ASSERT on.
+    // programming-error type mismatch the caller must report/DMQ_ASSERT on.
     bool CheckOrEstablishType(const dmq::xstring& topic, std::type_index expected) {
         auto it = m_typeIndices.find(topic);
         if (it != m_typeIndices.end())

@@ -1,6 +1,6 @@
-# OS / Threading Layer
+# OS Ports (DelegateMQ Abstraction Layer)
 
-This directory contains the Operating System abstraction layer for **DelegateMQ**. It provides the concrete threading implementations required to execute asynchronous delegates.
+This directory contains the OS part of the **DelegateMQ Abstraction Layer**: the concrete threading implementations required to execute asynchronous delegates, plus the portable mutex, semaphore, clock and critical-section types the whole library uses. The transport and serializer parts are in `port/transport` and `port/serialize`.
 
 By abstracting the threading model behind the `dmq::IThread` interface, DelegateMQ can run seamlessly on everything from high-performance servers (Windows/Linux) to resource-constrained embedded systems (FreeRTOS, ThreadX, Zephyr).
 
@@ -11,6 +11,21 @@ The subdirectories contain the platform-specific thread wrappers:
 * **`stdlib`**: Standard C++11 implementation.
     * *Target:* Windows, Linux, macOS, or any OS with a compliant C++ Standard Library.
     * *Implementation:* Uses `std::thread`, `std::mutex`, `std::condition_variable`, and `std::promise`.
+* **`win32`**: Native Windows implementation.
+    * *Target:* Windows.
+    * *Implementation:* Uses Win32 thread and message-queue APIs directly rather than `std::thread`.
+* **`posix`**: Raw POSIX implementation.
+    * *Target:* Linux (verified). Written against the POSIX API rather than any Linux-specific
+      syscall, but `pthread_condattr_setclock(CLOCK_MONOTONIC)` -- used here so timed waits are
+      immune to wall-clock jumps -- is a common POSIX extension present on Linux (glibc, musl) and
+      not guaranteed elsewhere (e.g. not implemented on Darwin/macOS), so treat portability beyond
+      Linux as untested rather than assumed.
+    * *Implementation:* Uses native POSIX primitives directly -- `pthread_create`, `pthread_mutex_t`,
+      `pthread_cond_t` (with `CLOCK_MONOTONIC` via `pthread_condattr_setclock`) -- rather than going
+      through `std::thread`. Mutex/ConditionVariable/Clock/ThisThread still reuse the same `std::`
+      types as `stdlib` (already thin wrappers over these same primitives under glibc/libstdc++);
+      only the `Thread` class itself is native, mirroring `win32`'s relationship to `stdlib` but for
+      POSIX. See `example/sample-projects/posix-linux/`.
 * **`freertos`**: Real-Time OS implementation.
     * *Target:* Embedded ARM Cortex-M (STM32, NXP, etc.), ESP32, and others running FreeRTOS.
     * *Implementation:* Uses native FreeRTOS primitives: `xTaskCreate`, `xQueueSend/Receive`, and `vTaskDelay`.
@@ -23,6 +38,12 @@ The subdirectories contain the platform-specific thread wrappers:
 * **`cmsis-rtos2`**: CMSIS-RTOS API v2 implementation.
     * *Target:* Any kernel compliant with the ARM CMSIS-RTOS2 standard (Keil RTX5, Micrium OS, etc.).
     * *Implementation:* Uses standard APIs `osThreadNew` and `osMessageQueuePut/Get`.
+* **`nuttx`**: Apache NuttX RTOS implementation.
+    * *Target:* Any board supported by NuttX (POSIX-compliant embedded RTOS), including its `sim` simulation target.
+    * *Implementation:* Uses NuttX's native POSIX APIs directly: `pthread_create`, `pthread_mutex_t`, `sem_t`, and a POSIX `mqueue` (with native `msg_prio`-based priority) for message passing.
+* **`bare-metal`**: No-OS support (`DMQ_THREAD_NONE`).
+    * *Target:* Super-loop firmware on ARM Cortex-M or RISC-V.
+    * *Implementation:* Provides `Clock`, `ThisThread` and an ISR-safe `CriticalSection` so synchronous delegates, signals and `dmq::util::Timer` work; there is no `Thread`, so asynchronous delegates are unavailable.
 * **`qt`**: Qt Framework implementation.
     * *Target:* Desktop or embedded GUI applications using Qt.
     * *Implementation:* Uses `QThread` and the native Signal & Slot mechanism (`moveToThread`) to safely dispatch delegates to the Qt Event Loop.
@@ -34,10 +55,13 @@ To select the appropriate threading model, set the `DMQ_THREAD` variable in your
 ```cmake
 # Options:
 # DMQ_THREAD_STDLIB        (Default for PC/Linux)
+# DMQ_THREAD_WIN32         (Native Win32 threads)
+# DMQ_THREAD_POSIX         (Raw POSIX pthreads -- Linux, verified)
 # DMQ_THREAD_FREERTOS      (FreeRTOS)
 # DMQ_THREAD_THREADX       (Azure RTOS ThreadX)
 # DMQ_THREAD_ZEPHYR        (Zephyr RTOS)
 # DMQ_THREAD_CMSIS_RTOS2   (ARM CMSIS-RTOS2)
+# DMQ_THREAD_NUTTX         (Apache NuttX RTOS)
 # DMQ_THREAD_QT            (Qt Framework)
 # DMQ_THREAD_NONE          (For Bare-metal super-loops)
 

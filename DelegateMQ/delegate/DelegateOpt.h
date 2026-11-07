@@ -4,16 +4,16 @@
 /// @file
 /// @brief Delegate library options header file.
 
-// Pull in user config if provided, otherwise use library defaults.
-// To provide your own config: -DDMQ_USER_CONFIG="path/to/DelegateMQConfig.h"
-#ifdef DMQ_USER_CONFIG
-    #include DMQ_USER_CONFIG
-#endif
-#include "DelegateMQConfig_Default.h"
+// Option selection (user config, port auto-detection, derived DMQ_* macros)
+// comes first so everything below sees the final options.
+#include "DelegateSelect.h"
 
 #if defined(_WIN32) || defined(_WIN64)
     #ifndef WIN32_LEAN_AND_MEAN
         #define WIN32_LEAN_AND_MEAN
+    #endif
+    #ifndef NOMINMAX
+        #define NOMINMAX
     #endif
 
     // If networking is active, include winsock2.h here to prevent macro 
@@ -24,97 +24,6 @@
         defined(DMQ_TRANSPORT_MQTT)
         #include <winsock2.h>
         #include <ws2tcpip.h>
-    #endif
-#endif
-
-// --- PLATFORM AUTO-DETECTION ---
-// If no threading model is defined, attempt to auto-select a default
-#if !defined(DMQ_THREAD_STDLIB) && !defined(DMQ_THREAD_WIN32) && \
-    !defined(DMQ_THREAD_FREERTOS) && !defined(DMQ_THREAD_THREADX) && \
-    !defined(DMQ_THREAD_ZEPHYR) && !defined(DMQ_THREAD_CMSIS_RTOS2) && \
-    !defined(DMQ_THREAD_QT) && !defined(DMQ_THREAD_NONE)
-
-    #if defined(_WIN32) || defined(__linux__) || defined(__APPLE__) || defined(__unix__)
-        #define DMQ_THREAD_STDLIB
-    #endif
-#endif
-
-// --- EMBEDDED RTOS THREAD CLASSIFICATION ---
-// Named composite macros for two related but distinct "is this DMQ_THREAD_*
-// an embedded RTOS port" questions, so downstream code (this file's own
-// DataBus default below, extras/util/NetworkConnect.h's host-header default)
-// references a name instead of each re-deriving its own copy of the
-// DMQ_THREAD_* list. Adding a new DMQ_THREAD_* port means updating these two
-// macros -- and Defaults.cmake's DMQ_DATABUS default, which mirrors
-// DMQ_THREAD_IS_EMBEDDED_RTOS's membership and says so in its own comment --
-// not every call site that happens to care about the answer.
-
-// True for every embedded RTOS thread port. Used to decide whether desktop-
-// oriented defaults (DataBus auto-enable, below) should apply.
-#if defined(DMQ_THREAD_FREERTOS) || defined(DMQ_THREAD_THREADX) || \
-    defined(DMQ_THREAD_ZEPHYR) || defined(DMQ_THREAD_CMSIS_RTOS2)
-    #define DMQ_THREAD_IS_EMBEDDED_RTOS
-#endif
-
-// True only for the subset of embedded RTOS thread ports whose simulator/
-// native build bundles its own network stack headers that collide with real
-// host BSD/Winsock headers (e.g. Zephyr's <zephyr/net/socket.h> redefining
-// sockaddr_in et al.). FreeRTOS is deliberately NOT included here: its
-// Win32/POSIX simulator ports (databus-freertos, freertos-linux) have no
-// native network stack of their own to collide with, and use real host
-// sockets on purpose.
-#if defined(DMQ_THREAD_THREADX) || defined(DMQ_THREAD_ZEPHYR) || defined(DMQ_THREAD_CMSIS_RTOS2)
-    #define DMQ_THREAD_HAS_NATIVE_NETWORK_STACK
-#endif
-
-// True when a real thread model is configured (desktop or embedded RTOS),
-// as opposed to DMQ_THREAD_NONE or no thread model at all (bare metal,
-// single-threaded). Named once here instead of hand-copying this same
-// 7-macro list at every call site that needs to know whether Mutex/
-// ConditionVariable/std::thread-equivalent support exists.
-#if defined(DMQ_THREAD_STDLIB) || defined(DMQ_THREAD_WIN32) || defined(DMQ_THREAD_QT) || \
-    defined(DMQ_THREAD_FREERTOS) || defined(DMQ_THREAD_THREADX) || \
-    defined(DMQ_THREAD_ZEPHYR) || defined(DMQ_THREAD_CMSIS_RTOS2)
-    #define DMQ_HAS_THREADING
-#endif
-
-// If no serialization model is defined, attempt to auto-select a default
-#if !defined(DMQ_SERIALIZE_SERIALIZE) && !defined(DMQ_SERIALIZE_RAPIDJSON) && \
-    !defined(DMQ_SERIALIZE_MSGPACK) && !defined(DMQ_SERIALIZE_CEREAL) && \
-    !defined(DMQ_SERIALIZE_BITSERY) && !defined(DMQ_SERIALIZE_NONE)
-
-    #if defined(_WIN32) || defined(__linux__) || defined(__APPLE__) || defined(__unix__)
-        #define DMQ_SERIALIZE_SERIALIZE
-    #else
-        #define DMQ_SERIALIZE_NONE
-    #endif
-#endif
-
-// Default to DataBus ON on Desktop if not explicitly disabled.
-//
-// _WIN32/__linux__/__APPLE__/__unix__ reflect the compiler/host doing the
-// building, not the actual target: an RTOS simulator sample (e.g.
-// zephyr-linux/threadx-linux/freertos-linux) compiles with a host GCC on a
-// Unix box despite targeting DMQ_THREAD_ZEPHYR/THREADX/FREERTOS, so this
-// used to auto-enable DataBus for those too even without CMake in the
-// picture. DataBus's NetworkConnect.h reaches for the host's own BSD
-// socket headers unconditionally on Linux/macOS/Windows, which can conflict
-// outright with a target's own native network stack headers (e.g. Zephyr's
-// <zephyr/net/socket.h> redefining sockaddr_in et al.) if the application
-// also pulls those in directly (a UDP transport sample, for instance).
-// DMQ_THREAD_IS_EMBEDDED_RTOS mirrors Defaults.cmake's equivalent CMake-
-// level default, for projects that set these macros by hand instead of
-// going through DelegateMQ.cmake.
-#if !defined(DMQ_DATABUS) && !defined(DMQ_DATABUS_OFF) && !defined(DMQ_THREAD_IS_EMBEDDED_RTOS)
-    #if defined(_WIN32) || defined(__linux__) || defined(__APPLE__) || defined(__unix__)
-        #define DMQ_DATABUS
-    #endif
-#endif
-
-// Default to DataBus Tools ON on Desktop if DataBus is active and not explicitly disabled
-#if defined(DMQ_DATABUS) && !defined(DMQ_DATABUS_TOOLS) && !defined(DMQ_DATABUS_TOOLS_OFF)
-    #if defined(_WIN32) || defined(__linux__) || defined(__APPLE__) || defined(__unix__)
-        #define DMQ_DATABUS_TOOLS
     #endif
 #endif
 
@@ -152,6 +61,10 @@
 #include <chrono>
 #if defined(DMQ_HAS_THREADING)
     #include <mutex>
+    #if !defined(__cpp_lib_scoped_lock)
+        // No std::scoped_lock on this toolchain; see dmq::ScopedLock below.
+        #include "port/os/common/PortableScopedLock.h"
+    #endif
 #endif
 
 // RTTI Detection Check
@@ -160,15 +73,18 @@
 #endif
 
 // Some OS port headers below (e.g. ThreadXMutex.h, ThreadXConditionVariable.h) use
-// ASSERT_TRUE in constructors. Include Fault.h here, ahead of those port headers,
+// DMQ_ASSERT_TRUE in constructors. Include Fault.h here, ahead of those port headers,
 // so the macro is defined before first use. Fault.h is include-guarded, so the
 // later #include "extras/util/Fault.h" below is a harmless no-op.
 #include "extras/util/Fault.h"
 
-#if defined(DMQ_THREAD_STDLIB) || defined(DMQ_THREAD_WIN32) || defined(DMQ_THREAD_QT)
-    // Windows / Linux / macOS / Qt (Standard Library)
+#if defined(DMQ_THREAD_STDLIB) || defined(DMQ_THREAD_WIN32) || defined(DMQ_THREAD_QT) || defined(DMQ_THREAD_POSIX)
+    // Windows / Linux / macOS / Qt (Standard Library) / POSIX (raw pthreads,
+    // but Mutex/ConditionVariable/Clock/ThisThread still reuse std:: here --
+    // see port/os/posix/PosixThread.h, the only file this port adds)
     #include <condition_variable>
     #include <thread>
+    #include "port/os/stdlib/StdlibThisThread.h"
 #elif defined(DMQ_THREAD_FREERTOS)
     #include "port/os/freertos/FreeRTOSClock.h"
     #include "port/os/freertos/FreeRTOSMutex.h"
@@ -193,6 +109,12 @@
     #include "port/os/cmsis-rtos2/CmsisRtos2CriticalSection.h"
     #include "port/os/cmsis-rtos2/CmsisRtos2Semaphore.h"
     #include "port/os/cmsis-rtos2/CmsisRtos2ThisThread.h"
+#elif defined(DMQ_THREAD_NUTTX)
+    #include "port/os/nuttx/NuttXClock.h"
+    #include "port/os/nuttx/NuttXMutex.h"
+    #include "port/os/nuttx/NuttXCriticalSection.h"
+    #include "port/os/nuttx/NuttXSemaphore.h"
+    #include "port/os/nuttx/NuttXThisThread.h"
 #elif defined(DMQ_THREAD_NONE)
     #include "port/os/bare-metal/BareMetalClock.h"
     #include "port/os/bare-metal/BareMetalCriticalSection.h"
@@ -218,13 +140,18 @@ namespace dmq
     };
 
     // --- PORTABLE SCOPED LOCK ---
-    // Maps to std::scoped_lock on all known threaded ports (desktop + RTOS).
-    // All RTOS mutex types satisfy BasicLockable (lock/unlock), so std::scoped_lock
-    // works with them directly. Falls back to a no-op for DMQ_THREAD_NONE and for
-    // any unrecognized bare-metal build where no thread model is defined.
-#if defined(DMQ_HAS_THREADING)
+    // std::scoped_lock on threaded ports (desktop + RTOS); all RTOS mutex types
+    // satisfy BasicLockable (lock/unlock), so it works with them directly. Some
+    // bare-metal standard libraries lack std::scoped_lock without thread support
+    // (e.g. Arm GNU Toolchain 14); those get dmq::os::PortableScopedLock
+    // (port/os/common/PortableScopedLock.h). No-op for DMQ_THREAD_NONE and for
+    // any bare-metal build with no thread model.
+#if defined(DMQ_HAS_THREADING) && defined(__cpp_lib_scoped_lock)
     template <typename... M>
     using ScopedLock = std::scoped_lock<M...>;
+#elif defined(DMQ_HAS_THREADING)
+    template <typename... M>
+    using ScopedLock = dmq::os::PortableScopedLock<M...>;
 #else
     // No-op: DMQ_THREAD_NONE or no thread model defined (bare-metal, single-threaded)
     template <typename... M>
@@ -240,8 +167,8 @@ namespace dmq
     // @TODO: Change aliases to switch clock type globally if necessary
 
     // --- CLOCK SELECTION ---
-#if defined(DMQ_THREAD_STDLIB) || defined(DMQ_THREAD_WIN32) || defined(DMQ_THREAD_QT)
-    // Windows / Linux / macOS / Qt
+#if defined(DMQ_THREAD_STDLIB) || defined(DMQ_THREAD_WIN32) || defined(DMQ_THREAD_QT) || defined(DMQ_THREAD_POSIX)
+    // Windows / Linux / macOS / Qt / POSIX
     using Clock = std::chrono::steady_clock;
 
 #elif defined(DMQ_THREAD_FREERTOS)
@@ -259,6 +186,10 @@ namespace dmq
 #elif defined(DMQ_THREAD_CMSIS_RTOS2)
     using Clock = dmq::os::CmsisRtos2Clock;
 
+#elif defined(DMQ_THREAD_NUTTX)
+    // Use the custom NuttX wrapper
+    using Clock = dmq::os::NuttXClock;
+
 #else
     // Assuming implemented the 'g_ticks' variable
     using Clock = dmq::os::BareMetalClock;
@@ -269,78 +200,45 @@ namespace dmq
     using Duration = typename Clock::duration;
     using TimePoint = typename Clock::time_point;
 
-    // --- THIS_THREAD (sleep_for / yield) SELECTION ---
+    // --- THIS_THREAD (sleep_for / yield / GetCurrent) SELECTION ---
     // Portable equivalents of std::this_thread::sleep_for()/yield() for the
-    // calling thread. Exists so library internals that need to delay or
-    // yield (e.g. RetryMonitor backoff) aren't forced to pull in a full
-    // dmq::os::Thread -- which also drags in the message queue, watchdog,
-    // and stats machinery -- just to sleep. Each dmq::os::Thread::Sleep()
-    // forwards here too, so every port's native delay call is implemented
-    // exactly once.
+    // calling thread, plus GetCurrent(): the dmq::IThread whose worker is the
+    // calling thread, or nullptr (registered by dmq::CurrentThreadScope in
+    // IThread.h). Exists so library internals that need to delay or yield
+    // (e.g. RetryMonitor backoff) aren't forced to pull in a full
+    // dmq::os::Thread -- which also drags in the message queue, watchdog, and
+    // stats machinery -- just to sleep. Each dmq::os::Thread::Sleep() forwards
+    // here too, so every port's native delay call is implemented exactly once.
+    // Each port implements it in port/os/<os>/<Os>ThisThread.h.
     //
     // A class (not a "this_thread" namespace) deliberately: sample/app code
     // throughout this project does `using namespace dmq; ... using namespace
     // std;` together, and a same-named nested namespace would make unqualified
     // this_thread::sleep_for() calls in that code ambiguous against
     // std::this_thread.
-#if defined(DMQ_THREAD_STDLIB) || defined(DMQ_THREAD_WIN32) || defined(DMQ_THREAD_QT)
-    // Windows / Linux / macOS / Qt -- std::this_thread is already portable here.
-    struct ThisThread {
-        template<typename Rep, typename Period>
-        static void sleep_for(std::chrono::duration<Rep, Period> d) { std::this_thread::sleep_for(d); }
-        static void yield() noexcept { std::this_thread::yield(); }
-    };
-
+#if defined(DMQ_THREAD_STDLIB) || defined(DMQ_THREAD_WIN32) || defined(DMQ_THREAD_QT) || defined(DMQ_THREAD_POSIX)
+    using ThisThread = dmq::os::StdlibThisThread;
 #elif defined(DMQ_THREAD_FREERTOS)
-    struct ThisThread {
-        template<typename Rep, typename Period>
-        static void sleep_for(std::chrono::duration<Rep, Period> d) {
-            dmq::os::FreeRTOSThisThread::sleep_for(std::chrono::duration_cast<std::chrono::milliseconds>(d));
-        }
-        static void yield() noexcept { dmq::os::FreeRTOSThisThread::yield(); }
-    };
-
+    using ThisThread = dmq::os::FreeRTOSThisThread;
 #elif defined(DMQ_THREAD_THREADX)
-    struct ThisThread {
-        template<typename Rep, typename Period>
-        static void sleep_for(std::chrono::duration<Rep, Period> d) {
-            dmq::os::ThreadXThisThread::sleep_for(std::chrono::duration_cast<std::chrono::milliseconds>(d));
-        }
-        static void yield() noexcept { dmq::os::ThreadXThisThread::yield(); }
-    };
-
+    using ThisThread = dmq::os::ThreadXThisThread;
 #elif defined(DMQ_THREAD_ZEPHYR)
-    struct ThisThread {
-        template<typename Rep, typename Period>
-        static void sleep_for(std::chrono::duration<Rep, Period> d) {
-            dmq::os::ZephyrThisThread::sleep_for(std::chrono::duration_cast<std::chrono::milliseconds>(d));
-        }
-        static void yield() noexcept { dmq::os::ZephyrThisThread::yield(); }
-    };
-
+    using ThisThread = dmq::os::ZephyrThisThread;
 #elif defined(DMQ_THREAD_CMSIS_RTOS2)
-    struct ThisThread {
-        template<typename Rep, typename Period>
-        static void sleep_for(std::chrono::duration<Rep, Period> d) {
-            dmq::os::CmsisRtos2ThisThread::sleep_for(std::chrono::duration_cast<std::chrono::milliseconds>(d));
-        }
-        static void yield() noexcept { dmq::os::CmsisRtos2ThisThread::yield(); }
-    };
-
+    using ThisThread = dmq::os::CmsisRtos2ThisThread;
+#elif defined(DMQ_THREAD_NUTTX)
+    using ThisThread = dmq::os::NuttXThisThread;
 #else
-    // Bare metal (DMQ_THREAD_NONE, or no thread model defined): busy-waits
-    // against BareMetalClock; yield() is a no-op (single thread of control).
-    struct ThisThread {
-        template<typename Rep, typename Period>
-        static void sleep_for(std::chrono::duration<Rep, Period> d) {
-            dmq::os::BareMetalThisThread::sleep_for(std::chrono::duration_cast<std::chrono::milliseconds>(d));
-        }
-        static void yield() noexcept { dmq::os::BareMetalThisThread::yield(); }
-    };
+    // Bare metal (DMQ_THREAD_NONE, or no thread model defined): sleep_for()
+    // busy-waits against BareMetalClock; yield() is a no-op.
+    using ThisThread = dmq::os::BareMetalThisThread;
 #endif
 
     /// @brief Policy applied when a dmq::os::Thread port's message queue is full.
-    /// @details Only meaningful when the port's maxQueueSize > 0.
+    /// @details Always enforced -- a constructor's maxQueueSize == 0 is a sentinel meaning
+    /// "use this port's default capacity" (dmq::DEFAULT_QUEUE_SIZE for the RTOS ports,
+    /// dmq::THREAD_DESKTOP_QUEUE_SIZE for stdlib/Win32), not "disable the cap." Every port's
+    /// effective queue capacity is therefore always > 0 at runtime.
     ///   - DROP:    DispatchDelegate() silently discards the message and returns immediately.
     ///   - FAULT:   DispatchDelegate() triggers a system fault if the queue is full.
     ///   - TIMEOUT: DispatchDelegate() waits up to dispatchTimeout, then logs and drops.
@@ -352,9 +250,26 @@ namespace dmq
     /// dmq::os::FullPolicy so existing port-qualified references keep working.
     enum class FullPolicy { DROP, FAULT, TIMEOUT };
 
+    /// @brief What a dmq::os::Thread does with messages still queued when ExitThread() is called.
+    ///   - DRAIN:   Invoke every message queued before ExitThread(), then exit (default).
+    ///   - DISCARD: Invoke only the message already running, then exit. Queued messages are
+    ///              discarded without being invoked; a sender blocked on one (an async-wait
+    ///              delegate) is released and sees the call fail (DelegateMsg::Cancel()).
+    ///
+    /// Use DISCARD for fast shutdown when pending work is disposable (telemetry, UI refresh).
+    /// A thread that exits itself (ExitThread() called from its own message handler) always
+    /// discards, since the thread's owner may already be destroyed.
+    enum class ExitPolicy { DRAIN, DISCARD };
+
     /// @brief Default timeout for the TIMEOUT queue-full policy across all Thread ports.
     /// Override via DMQ_DEFAULT_DISPATCH_TIMEOUT in DelegateMQConfig.h.
     inline constexpr std::chrono::seconds DEFAULT_DISPATCH_TIMEOUT{DMQ_DEFAULT_DISPATCH_TIMEOUT};
+
+    /// @brief Default quiet time before a Thread's idle handler runs, and between
+    /// calls while its queue stays empty. See Thread::SetIdleHandler().
+    /// Override via DMQ_THREAD_IDLE_INTERVAL in DelegateMQConfig.h.
+    inline constexpr std::chrono::milliseconds THREAD_IDLE_INTERVAL{DMQ_THREAD_IDLE_INTERVAL};
+    static_assert(DMQ_THREAD_IDLE_INTERVAL > 0, "DMQ_THREAD_IDLE_INTERVAL must be greater than zero");
 
     // --- RESOURCE LIMITS & SBO CONFIGURATION ---
 
@@ -367,17 +282,70 @@ namespace dmq
     /// Override via DMQ_SIGNAL_SBO_COUNT in delegatemqconfig.h.
     inline constexpr size_t SIGNAL_SBO_COUNT = DMQ_SIGNAL_SBO_COUNT;
 
-    /// @brief Default internal queue size for all dmq::os::Thread ports.
+    /// @brief Default internal queue size (maxQueueSize == 0) for the RTOS
+    /// dmq::os::Thread ports, where the backing queue primitive requires a
+    /// fixed capacity at creation.
     /// Override via DMQ_DEFAULT_QUEUE_SIZE in delegatemqconfig.h.
     inline constexpr size_t DEFAULT_QUEUE_SIZE = DMQ_DEFAULT_QUEUE_SIZE;
+
+    /// @brief Stack size of each dmq::os::Thread on the RTOS ports, in each
+    /// port's native unit (FreeRTOS: words, for dynamically allocated stacks;
+    /// the others: bytes).
+    /// Override via DMQ_FREERTOS_STACK_WORDS, DMQ_THREADX_STACK_BYTES,
+    /// DMQ_ZEPHYR_STACK_BYTES, DMQ_CMSIS_RTOS2_STACK_BYTES and
+    /// DMQ_NUTTX_STACK_BYTES in delegatemqconfig.h.
+    inline constexpr uint32_t FREERTOS_STACK_WORDS = DMQ_FREERTOS_STACK_WORDS;
+    inline constexpr size_t THREADX_STACK_BYTES = DMQ_THREADX_STACK_BYTES;
+    inline constexpr size_t ZEPHYR_STACK_BYTES = DMQ_ZEPHYR_STACK_BYTES;
+    inline constexpr size_t CMSIS_RTOS2_STACK_BYTES = DMQ_CMSIS_RTOS2_STACK_BYTES;
+    inline constexpr size_t NUTTX_STACK_BYTES = DMQ_NUTTX_STACK_BYTES;
+
+    /// @brief Default dmq::os::Thread priority on the ThreadX, Zephyr (passed to
+    /// K_PRIO_PREEMPT()) and NuttX (SCHED_FIFO) ports. SetThreadPriority()
+    /// overrides it per thread.
+    /// Override via DMQ_THREADX_THREAD_PRIORITY, DMQ_ZEPHYR_THREAD_PRIORITY and
+    /// DMQ_NUTTX_THREAD_PRIORITY in delegatemqconfig.h.
+    inline constexpr int THREADX_THREAD_PRIORITY = DMQ_THREADX_THREAD_PRIORITY;
+    inline constexpr int ZEPHYR_THREAD_PRIORITY = DMQ_ZEPHYR_THREAD_PRIORITY;
+    inline constexpr int NUTTX_THREAD_PRIORITY = DMQ_NUTTX_THREAD_PRIORITY;
+
+    /// @brief Fallback queue size (maxQueueSize == 0) for the desktop
+    /// stdlib/Win32 Thread ports only, which back their queue with a plain
+    /// std::deque and would otherwise grow without bound if the destination
+    /// thread is dead/stuck. A high-water-mark safety net, not a throughput
+    /// limiter -- large enough to never interfere with normal desktop bursts.
+    /// Override via DMQ_THREAD_DESKTOP_QUEUE_SIZE in delegatemqconfig.h.
+    inline constexpr size_t THREAD_DESKTOP_QUEUE_SIZE = DMQ_THREAD_DESKTOP_QUEUE_SIZE;
 
     /// @brief Max number of threads that can be monitored by the watchdog.
     /// Override via DMQ_MAX_WATCHDOG_THREADS in delegatemqconfig.h.
     inline constexpr size_t MAX_WATCHDOG_THREADS = DMQ_MAX_WATCHDOG_THREADS;
 
+    /// @brief A watched thread's queue wait (and Qt's heartbeat timer) is its
+    /// watchdog timeout divided by this.
+    /// Override via DMQ_WATCHDOG_HEARTBEAT_DIVISOR in delegatemqconfig.h.
+    inline constexpr int WATCHDOG_HEARTBEAT_DIVISOR = DMQ_WATCHDOG_HEARTBEAT_DIVISOR;
+    static_assert(WATCHDOG_HEARTBEAT_DIVISOR >= 2, "DMQ_WATCHDOG_HEARTBEAT_DIVISOR must be at least 2");
+
+    /// @brief Max threads registered for ThisThread::GetCurrent() at once on RTOS
+    /// ports (see port/os/common/CurrentThreadStorage.h). Exceeding it faults.
+    /// Override via DMQ_MAX_CURRENT_THREADS in delegatemqconfig.h.
+    inline constexpr size_t MAX_CURRENT_THREADS = DMQ_MAX_CURRENT_THREADS;
+
     /// @brief Max number of remote Participants the DataBus can hold without heap allocation.
     /// Override via DMQ_MAX_PARTICIPANTS in delegatemqconfig.h.
     inline constexpr size_t MAX_PARTICIPANTS = DMQ_MAX_PARTICIPANTS;
+
+    /// @brief serialize (msg_serialize.h) limits: max string length, max container
+    /// element count and max nesting depth of serialize::I objects.
+    /// Override via DMQ_SERIALIZE_MAX_STRING_SIZE, DMQ_SERIALIZE_MAX_CONTAINER_SIZE
+    /// and DMQ_SERIALIZE_MAX_NESTING in delegatemqconfig.h.
+    inline constexpr uint16_t SERIALIZE_MAX_STRING_SIZE = DMQ_SERIALIZE_MAX_STRING_SIZE;
+    inline constexpr uint16_t SERIALIZE_MAX_CONTAINER_SIZE = DMQ_SERIALIZE_MAX_CONTAINER_SIZE;
+    inline constexpr size_t SERIALIZE_MAX_NESTING = DMQ_SERIALIZE_MAX_NESTING;
+    static_assert(DMQ_SERIALIZE_MAX_STRING_SIZE <= 65535 && DMQ_SERIALIZE_MAX_CONTAINER_SIZE <= 65535,
+        "serialize length fields are 16 bits");
+    static_assert(DMQ_SERIALIZE_MAX_NESTING >= 1, "DMQ_SERIALIZE_MAX_NESTING must be at least 1");
 
     /// @brief Default max remote peers per NetworkNode instance (fixed allocation).
     /// Override via DMQ_NETWORK_NODE_MAX_PEERS in delegatemqconfig.h, or per-instantiation
@@ -403,13 +371,37 @@ namespace dmq
     /// via TransportMonitor's timeout constructor parameter.
     inline constexpr Duration TRANSPORT_MONITOR_TIMEOUT = std::chrono::seconds(DMQ_TRANSPORT_MONITOR_TIMEOUT_SEC);
 
+    /// @brief How long a received sequence number counts toward duplicate detection.
+    /// Override via DMQ_SEQ_HISTORY_EXPIRY_MS in delegatemqconfig.h.
+    inline constexpr Duration SEQ_HISTORY_EXPIRY = std::chrono::milliseconds(DMQ_SEQ_HISTORY_EXPIRY_MS);
+
+    /// @brief Default node ID sent in every DmqHeader (0 = unset).
+    /// Override via DMQ_NODE_ID in delegatemqconfig.h.
+    static_assert(DMQ_NODE_ID >= 0 && DMQ_NODE_ID <= 255, "DMQ_NODE_ID must be 0-255");
+    inline constexpr uint8_t NODE_ID = DMQ_NODE_ID;
+
     /// @brief Max number of pending messages the TransportMonitor can track.
     /// Override via DMQ_TRANSPORT_MONITOR_MAX_PENDING in delegatemqconfig.h.
     inline constexpr size_t MAX_TRANSPORT_MONITOR_PENDING = DMQ_TRANSPORT_MONITOR_MAX_PENDING;
 
+    /// @brief Embedded UDP transports: datagram buffer size and receive timeouts.
+    /// Override via DMQ_UDP_BUFFER_SIZE / DMQ_UDP_PUB_RECV_TIMEOUT_MS /
+    /// DMQ_UDP_SUB_RECV_TIMEOUT_MS in delegatemqconfig.h.
+    inline constexpr size_t UDP_BUFFER_SIZE = DMQ_UDP_BUFFER_SIZE;
+    inline constexpr std::chrono::milliseconds UDP_PUB_RECV_TIMEOUT{ DMQ_UDP_PUB_RECV_TIMEOUT_MS };
+    inline constexpr std::chrono::milliseconds UDP_SUB_RECV_TIMEOUT{ DMQ_UDP_SUB_RECV_TIMEOUT_MS };
+
+    /// @brief STM32 UART transport sizes and timeouts.
+    /// Override via DMQ_UART_RX_RING_SIZE / DMQ_UART_MAX_PAYLOAD /
+    /// DMQ_UART_TX_TIMEOUT_MS / DMQ_UART_FRAME_TIMEOUT_MS in delegatemqconfig.h.
+    inline constexpr size_t UART_RX_RING_SIZE = DMQ_UART_RX_RING_SIZE;
+    inline constexpr size_t UART_MAX_PAYLOAD = DMQ_UART_MAX_PAYLOAD;
+    inline constexpr std::chrono::milliseconds UART_TX_TIMEOUT{ DMQ_UART_TX_TIMEOUT_MS };
+    inline constexpr std::chrono::milliseconds UART_FRAME_TIMEOUT{ DMQ_UART_FRAME_TIMEOUT_MS };
+
     // --- MUTEX / LOCK SELECTION ---
-#if defined(DMQ_THREAD_STDLIB) || defined(DMQ_THREAD_WIN32) || defined(DMQ_THREAD_QT)
-    // Windows / Linux / macOS / Qt
+#if defined(DMQ_THREAD_STDLIB) || defined(DMQ_THREAD_WIN32) || defined(DMQ_THREAD_QT) || defined(DMQ_THREAD_POSIX)
+    // Windows / Linux / macOS / Qt / POSIX
     using Mutex = std::mutex;
     using RecursiveMutex = std::recursive_mutex;
     // No ISR concept reachable from userspace on desktop OSes, and
@@ -460,15 +452,13 @@ namespace dmq
     using Mutex = dmq::os::ZephyrMutex;
     using RecursiveMutex = dmq::os::ZephyrRecursiveMutex;
     // ISR-safe (irq_lock()/irq_unlock(key), not a k_mutex) -- see
-    // ZephyrCriticalSection.h. UNVERIFIED: no Zephyr SDK/west workspace is
-    // available in this development environment to build and run it; review
-    // before relying on it in production.
+    // ZephyrCriticalSection.h.
     using CriticalSection = dmq::os::ZephyrCriticalSection;
     // No dmq::ConditionVariable port for Zephyr (no DMQ_HAS_CV), but
     // dmq::Semaphore is available via Zephyr's own native k_sem instead of
     // the generic condvar+mutex implementation -- see ZephyrSemaphore.h and
     // delegate/Semaphore.h. This is what makes DelegateAsyncWait available
-    // here. UNVERIFIED, same caveat as CriticalSection above.
+    // here.
     using Semaphore = dmq::os::ZephyrSemaphore;
     #define DMQ_HAS_SEMAPHORE
     template<typename T> using LockGuard = PortableLockGuard<T>;
@@ -486,9 +476,29 @@ namespace dmq
     // native condvar primitive to build one from), but dmq::Semaphore is
     // available via osSemaphore directly instead -- see
     // CmsisRtos2Semaphore.h and delegate/Semaphore.h. This is what makes
-    // DelegateAsyncWait available here. UNVERIFIED, same caveat as
-    // CriticalSection above.
+    // DelegateAsyncWait available here.
     using Semaphore = dmq::os::CmsisRtos2Semaphore;
+    #define DMQ_HAS_SEMAPHORE
+    template<typename T> using LockGuard = PortableLockGuard<T>;
+
+#elif defined(DMQ_THREAD_NUTTX)
+    // Use the custom NuttX wrapper (NuttX implements real POSIX
+    // pthread_mutex_t, unlike the bespoke kernel-object wrappers the other
+    // RTOS ports need).
+    using Mutex = dmq::os::NuttXMutex;
+    using RecursiveMutex = dmq::os::NuttXRecursiveMutex;
+    // ISR-safe (up_irq_save()/up_irq_restore(), NuttX's own architecture-
+    // portable interrupt-masking primitive, not a pthread_mutex_t) -- see
+    // NuttXCriticalSection.h, including its FLAT-vs-PROTECTED/KERNEL-build
+    // caveat.
+    using CriticalSection = dmq::os::NuttXCriticalSection;
+    // No dmq::ConditionVariable port for NuttX (no DMQ_HAS_CV) -- not
+    // because NuttX lacks pthread_cond_t (it has a real one), but because
+    // dmq::Semaphore is available via NuttX's own native sem_t instead of
+    // the generic condvar+mutex implementation -- see NuttXSemaphore.h and
+    // delegate/Semaphore.h. This is what makes DelegateAsyncWait available
+    // here.
+    using Semaphore = dmq::os::NuttXSemaphore;
     #define DMQ_HAS_SEMAPHORE
     template<typename T> using LockGuard = PortableLockGuard<T>;
 
@@ -526,7 +536,7 @@ namespace dmq
     #include "extras/util/Fault.h"
     // Use assert error handling. Change assert to a different error 
     // handler as required by the target application.
-    #define BAD_ALLOC() ASSERT()
+    #define BAD_ALLOC() DMQ_ASSERT()
 #else
     #include "extras/util/Fault.h"
     #include <new>
@@ -570,17 +580,16 @@ namespace dmq
         template <typename T>
         using stl_allocator = std::allocator<T>;
 
+        // An alias, like xmap/xset here and xlist under DMQ_ALLOCATOR, so code
+        // overloaded on std::list (e.g. msg_serialize.h) accepts it in both builds.
         template <typename T, typename Alloc = stl_allocator<T>>
-        class xlist : public std::list<T, Alloc> {
-        public:
-            using std::list<T, Alloc>::list; // Inherit constructors
-            using std::list<T, Alloc>::operator=;
-        };
+        using xlist = std::list<T, Alloc>;
 
-        typedef std::basic_ostringstream<char, std::char_traits<char>, stl_allocator<char>> xostringstream;
-        typedef std::basic_stringstream<char, std::char_traits<char>, stl_allocator<char>> xstringstream;
+        // stl_allocator is std::allocator here, so these are the standard types
+        typedef std::ostringstream xostringstream;
+        typedef std::stringstream xstringstream;
 
-        typedef std::basic_string<char, std::char_traits<char>, stl_allocator<char>> xstring;
+        typedef std::string xstring;
 
         // Fallback xmake_shared — uses std::make_shared when fixed-block allocator is disabled
         template <typename T, typename... Args>

@@ -1,9 +1,14 @@
-#ifndef _WIN32
-#error "port/os/win32/Win32Thread.cpp is Windows-only and must not be compiled on non-Windows targets. Remove this file from your build configuration."
+// Compiles to nothing unless DMQ_THREAD_WIN32 is selected, so every DelegateMQ source
+// file can be added to a build (see src/DelegateMQ.cpp).
+#include "delegate/DelegateSelect.h"
+#if defined(DMQ_THREAD_WIN32) && !defined(_WIN32)
+#error "DMQ_THREAD_WIN32 is Windows-only. Select another DMQ_THREAD_* port for this target."
 #endif
+#if defined(DMQ_THREAD_WIN32)
 
 #include "DelegateMQ.h"
 #include "Win32Thread.h"
+#include "port/os/common/ThreadHooks.h"
 #include "extras/util/Fault.h"
 #include <iostream>
 
@@ -23,7 +28,7 @@ static thread_local bool* t_self_exit = nullptr;
 Win32Thread::Win32Thread(const char* threadName, size_t maxQueueSize, FullPolicy fullPolicy, dmq::Duration dispatchTimeout, const char* cpuName)
     : THREAD_NAME(threadName)
     , CPU_NAME(cpuName)
-    , MAX_QUEUE_SIZE(maxQueueSize)
+    , MAX_QUEUE_SIZE(maxQueueSize == 0 ? dmq::THREAD_DESKTOP_QUEUE_SIZE : maxQueueSize)
     , FULL_POLICY(fullPolicy)
     , m_dispatchTimeout(dispatchTimeout)
     , m_exit(false)
@@ -64,16 +69,33 @@ bool Win32Thread::CreateThread(std::optional<dmq::Duration> watchdogTimeout)
     if (m_hThread == NULL)
     {
         m_exit = false;
+        // Held from creation, so the watchdog never sees a gated thread as hung
+        // before it reaches the gate (e.g. created before the scheduler runs)
+        m_startGate.OnCreate();
+        // Set before the thread exists: its loop reads the timeout before its
+        // first queue wait, and an idle thread waits forever with no timeout
+        m_lastAliveTime.store(Timer::GetNow());
+        m_watchdogTimeout.store(watchdogTimeout.value_or(dmq::Duration(0)));
 
         // Manual-reset event for startup synchronization
         m_hStartEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
 
-        m_hThread = ::CreateThread(NULL, 0, ThreadProc, this, 0, &m_threadId);
-        if (m_hThread == NULL) return false;
+        // Created suspended so m_hThread/m_threadId are stored before the thread
+        // runs: the start handler may call IsCurrentThread() or dispatch to it.
+        m_hThread = ::CreateThread(NULL, 0, ThreadProc, this, CREATE_SUSPENDED, &m_threadId);
+        if (m_hThread == NULL) {
+            m_watchdogTimeout.store(dmq::Duration(0));  // no thread to refresh the heartbeat
+            m_startGate.OnCreateFailed();
+            CloseHandle(m_hStartEvent);
+            m_hStartEvent = NULL;
+            return false;
+        }
 
         // Set the thread name so it shows in the Visual Studio Debug Location toolbar
         std::wstring wname(THREAD_NAME.begin(), THREAD_NAME.end());
         SetThreadDescription(m_hThread, wname.c_str());
+
+        ResumeThread(m_hThread);
 
         // Wait for the thread to enter the Process method
         WaitForSingleObject(m_hStartEvent, INFINITE);
@@ -85,7 +107,6 @@ bool Win32Thread::CreateThread(std::optional<dmq::Duration> watchdogTimeout)
         // Caller wants a watchdog timer?
         if (watchdogTimeout.has_value())
         {
-            m_watchdogTimeout = watchdogTimeout.value();
 
             // Add to watchdog registry if not already present
             {
@@ -135,7 +156,10 @@ bool Win32Thread::DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg)
     {
         if (FULL_POLICY == FullPolicy::DROP)
         {
+            size_t depth = m_highQueue.size() + m_normalQueue.size();
             LeaveCriticalSection(&m_cs);
+            if (m_droppedHandler)
+                m_droppedHandler(depth);
             return false; // silently discard
         }
 
@@ -143,7 +167,7 @@ bool Win32Thread::DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg)
         {
             LeaveCriticalSection(&m_cs);
             printf("[Thread] CRITICAL: Queue full on thread '%s'! TRIGGERING FAULT.\n", THREAD_NAME.c_str());
-            ASSERT_TRUE(false);
+            DMQ_ASSERT_TRUE(false);
             return false;
         }
 
@@ -155,8 +179,11 @@ bool Win32Thread::DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg)
             {
                 if (!SleepConditionVariableCS(&m_cvNotFull, &m_cs, dwTimeout))
                 {
+                    size_t depth = m_highQueue.size() + m_normalQueue.size();
                     LeaveCriticalSection(&m_cs);
                     printf("[Thread] WARNING: Queue post timed out on '%s' — possible deadlock. Message dropped.\n", THREAD_NAME.c_str());
+                    if (m_droppedHandler)
+                        m_droppedHandler(depth);
                     return false;
                 }
             }
@@ -206,8 +233,41 @@ void Win32Thread::Process()
     bool selfExit = false;
     t_self_exit = &selfExit;
 
+    // Exit and idle handlers are copied onto this stack frame so they work on
+    // every return path, including a self-exit where 'this' may already be freed.
+    ThreadExitGuard exitGuard(m_exitHandler);
+    ThreadIdleTimer idle(m_idleHandler, m_idleInterval);
+
+    // dmq::ThisThread::GetCurrent() returns this thread from here on. Declared
+    // after exitGuard, so it is cleared again before the exit handler runs.
+    dmq::CurrentThreadScope currentScope(this);
+
+    if (m_startHandler)
+        m_startHandler();
+
+    // A start handler that exited this thread (ExitThread() on itself) leaves
+    // right after the signal below: once CreateThread() returns, the Thread may
+    // be destroyed, so nothing after the signal may touch 'this'.
+    const bool exitedInStart = selfExit;
+
     // Signal that the thread has started processing to notify CreateThread
     SetEvent(m_hStartEvent);
+    if (exitedInStart) { t_self_exit = nullptr; return; }
+
+    // Optional start gate: wait here, ready but processing nothing, until it opens
+    if (m_startGate.Enabled())
+    {
+        const bool opened = m_startGate.Wait(m_exit);
+        m_lastAliveTime.store(Timer::GetNow());   // before Passed(): no stale watchdog read
+        m_startGate.Passed();
+        if (!opened)
+        {
+            // ExitThread() while held: leave without running any message.
+            // ExitThread() cancels what is still queued once this thread ends.
+            t_self_exit = nullptr;
+            return;
+        }
+    }
 
     while (!selfExit)
     {
@@ -223,13 +283,20 @@ void Win32Thread::Process()
 
         // Wait for message to be added to the queue.
         // If watchdog active, use a finite timeout so we can periodically update 
-        // m_lastAliveTime while idle. Otherwise, block forever.
+        // m_lastAliveTime while idle. If an idle handler is set, wake no later
+        // than when it is due. Otherwise, block forever.
         DWORD dwTimeout = INFINITE;
         if (watchdogTimeout.count() > 0)
         {
             auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(watchdogTimeout).count();
-            dwTimeout = static_cast<DWORD>(ms / 4);
+            dwTimeout = static_cast<DWORD>(ms / dmq::WATCHDOG_HEARTBEAT_DIVISOR);
             if (dwTimeout == 0) dwTimeout = 1;
+        }
+        if (idle.Enabled())
+        {
+            auto untilIdle = std::chrono::ceil<std::chrono::milliseconds>(idle.WaitTime(dmq::Duration(-1))).count();
+            if (static_cast<DWORD>(untilIdle) < dwTimeout)
+                dwTimeout = static_cast<DWORD>(untilIdle);
         }
 
         while ((m_highQueue.empty() && m_normalQueue.empty()) && !m_exit.load())
@@ -248,10 +315,13 @@ void Win32Thread::Process()
             break;
         }
 
-        // If queue still empty, it means we timed out. Loop again to update m_lastAliveTime.
+        // If queue still empty, it means we timed out. Run the idle handler if it is
+        // due, then loop again to update m_lastAliveTime.
         if ((m_highQueue.empty() && m_normalQueue.empty()))
         {
             LeaveCriticalSection(&m_cs);
+            if (idle.IsDue())
+                idle.Run();
             continue;
         }
 
@@ -289,9 +359,9 @@ void Win32Thread::Process()
 #endif
 
                 auto delegateMsg = msg->GetData();
-                ASSERT_TRUE(delegateMsg);
+                DMQ_ASSERT_TRUE(delegateMsg);
                 auto invoker = delegateMsg->GetInvoker();
-                ASSERT_TRUE(invoker);
+                DMQ_ASSERT_TRUE(invoker);
 
 #if defined(DMQ_DATABUS_TOOLS)
                 dmq::TimePoint start = Timer::GetNow();
@@ -299,31 +369,31 @@ void Win32Thread::Process()
 #if defined(__cpp_exceptions) && !defined(DMQ_ASSERTS)
                 try {
                     bool success = invoker->Invoke(delegateMsg);
-                    if (!selfExit) ASSERT_TRUE(success);
+                    if (!selfExit) DMQ_ASSERT_TRUE(success);
                 }
                 catch (const std::bad_alloc& e) {
                     std::cerr << "[Thread:" << THREAD_NAME << "] Unhandled bad_alloc in delegate callback: " << e.what() << std::endl;
-                    ASSERT();
+                    DMQ_ASSERT();
                 }
                 catch (const std::invalid_argument& e) {
                     std::cerr << "[Thread:" << THREAD_NAME << "] Unhandled invalid_argument in delegate callback: " << e.what() << std::endl;
-                    ASSERT();
+                    DMQ_ASSERT();
                 }
                 catch (const std::runtime_error& e) {
                     std::cerr << "[Thread:" << THREAD_NAME << "] Unhandled runtime_error in delegate callback: " << e.what() << std::endl;
-                    ASSERT();
+                    DMQ_ASSERT();
                 }
                 catch (const std::exception& e) {
                     std::cerr << "[Thread:" << THREAD_NAME << "] Unhandled exception in delegate callback: " << e.what() << std::endl;
-                    ASSERT();
+                    DMQ_ASSERT();
                 }
                 catch (...) {
                     std::cerr << "[Thread:" << THREAD_NAME << "] Unhandled unknown exception in delegate callback." << std::endl;
-                    ASSERT();
+                    DMQ_ASSERT();
                 }
 #else
                 bool success = invoker->Invoke(delegateMsg);
-                if (!selfExit) ASSERT_TRUE(success);
+                if (!selfExit) DMQ_ASSERT_TRUE(success);
 #endif
                 if (selfExit) {
                     t_self_exit = nullptr;
@@ -354,6 +424,9 @@ void Win32Thread::Process()
                 break;
             }
         }
+
+        // Any message restarts the idle countdown
+        idle.Restart();
     }
     t_self_exit = nullptr;
 }
@@ -361,9 +434,13 @@ void Win32Thread::Process()
 //----------------------------------------------------------------------------
 // ExitThread
 //----------------------------------------------------------------------------
-void Win32Thread::ExitThread()
+void Win32Thread::ExitThread(ExitPolicy policy)
 {
     if (m_hThread == NULL) return;
+
+    // Messages taken off the queues without being invoked; canceled outside the lock
+    decltype(m_highQueue) discardedHigh;
+    decltype(m_normalQueue) discardedNormal;
 
     EnterCriticalSection(&m_cs);
 
@@ -371,9 +448,17 @@ void Win32Thread::ExitThread()
     // This ensures that when a blocked producer wakes up, it sees m_exit == true immediately.
     m_exit.store(true);
 
+    // DISCARD: empty the queues so the exit message is the next one processed
+    if (policy == ExitPolicy::DISCARD)
+    {
+        discardedHigh.swap(m_highQueue);
+        discardedNormal.swap(m_normalQueue);
+    }
+
     // Explicitly allow Exit message to bypass the MAX_QUEUE_SIZE limit.
     // We do not wait on m_cvNotFull here to prevent deadlock during shutdown.
-    m_highQueue.push_back(xmake_shared<ThreadMsg>(MSG_EXIT_THREAD, nullptr));
+    // Queued last, so DRAIN invokes every message already queued first.
+    m_normalQueue.push_back(xmake_shared<ThreadMsg>(MSG_EXIT_THREAD, nullptr));
 
     // Wake up consumers
     WakeConditionVariable(&m_cvNotEmpty);
@@ -383,6 +468,14 @@ void Win32Thread::ExitThread()
 
     LeaveCriticalSection(&m_cs);
 
+    CancelAll(discardedHigh);
+    CancelAll(discardedNormal);
+
+    // A thread held at its start gate isn't waiting on its queue: wake it so it
+    // sees the exit flag (set above) and leaves. Never touches the gate itself,
+    // which may be destroyed once the thread is released.
+    m_startGate.Wake();
+
     // Prevent deadlock if ExitThread is called from within the thread itself
     if (::GetCurrentThreadId() != m_threadId)
     {
@@ -391,7 +484,22 @@ void Win32Thread::ExitThread()
     else
     {
         if (t_self_exit) *t_self_exit = true;
+        m_startGate.Leave();     // exited from its start handler: never reaches the gate
     }
+
+    // Normally empty. After a self-exit the loop returns without draining,
+    // so anything still queued is discarded here.
+    EnterCriticalSection(&m_cs);
+    discardedHigh.swap(m_highQueue);
+    discardedNormal.swap(m_normalQueue);
+    LeaveCriticalSection(&m_cs);
+    CancelAll(discardedHigh);
+    CancelAll(discardedNormal);
+
+    // The thread has finished (or, on a self-exit, is in its last handler):
+    // stop watchdog checks. Not earlier, so a thread that hangs while
+    // ExitThread() waits for it is still reported.
+    m_watchdogTimeout.store(dmq::Duration(0));
 
     CloseHandle(m_hThread);
     m_hThread = NULL;
@@ -446,6 +554,9 @@ void Win32Thread::WatchdogCheckAll()
 //----------------------------------------------------------------------------
 void Win32Thread::WatchdogCheck()
 {
+    if (m_startGate.IsHeld())
+        return;     // held at its start gate by design, not hung
+
     auto now = Timer::GetNow();
     auto lastAlive = m_lastAliveTime.load();
     auto watchdogTimeout = m_watchdogTimeout.load();
@@ -537,3 +648,5 @@ Win32Thread::ThreadStats Win32Thread::SnapshotStats()
 #endif
 
 } // namespace dmq::os
+
+#endif // DMQ_THREAD_WIN32

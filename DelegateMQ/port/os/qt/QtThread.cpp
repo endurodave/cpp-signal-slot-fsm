@@ -1,21 +1,32 @@
-#ifndef DMQ_THREAD_QT
-#error "port/os/qt/QtThread.cpp requires DMQ_THREAD_QT. Remove this file from your build configuration or define DMQ_THREAD_QT."
-#endif
+// Compiles to nothing unless DMQ_THREAD_QT is selected, so every DelegateMQ source
+// file can be added to a build (see src/DelegateMQ.cpp).
+#include "delegate/DelegateSelect.h"
+#if defined(DMQ_THREAD_QT)
 
 #include "DelegateMQ.h"
 #include "QtThread.h"
 #include "extras/util/Fault.h"
 #include <QDebug>
+#include <limits>
 
 namespace dmq::os {
 
 using namespace dmq;
 using namespace dmq::util;
 
-// Define ASSERT_TRUE if not already defined
-#ifndef ASSERT_TRUE
-#define ASSERT_TRUE(x) Q_ASSERT(x)
+// Define DMQ_ASSERT_TRUE if not already defined
+#ifndef DMQ_ASSERT_TRUE
+#define DMQ_ASSERT_TRUE(x) Q_ASSERT(x)
 #endif
+
+// QTimer takes an int millisecond interval: at least 1, clamped so a very long
+// interval (over ~24 days) doesn't overflow
+static int ToTimerInterval(long long ms)
+{
+    if (ms < 1) return 1;
+    if (ms > std::numeric_limits<int>::max()) return std::numeric_limits<int>::max();
+    return static_cast<int>(ms);
+}
 
 // Register the metatype ID once
 static int registerId = qRegisterMetaType<std::shared_ptr<dmq::DelegateMsg>>();
@@ -24,6 +35,18 @@ static int registerId = qRegisterMetaType<std::shared_ptr<dmq::DelegateMsg>>();
 // Worker::OnDispatch
 //----------------------------------------------------------------------------
 void Worker::OnDispatch(std::shared_ptr<dmq::DelegateMsg> msg) {
+    // Watchdog heartbeat: the event loop reached another message
+    if (m_thread)
+        m_thread->ThreadCheck();
+
+    // ExitPolicy::DISCARD: skip messages queued ahead of the event loop's quit
+    if (m_discard.load()) {
+        if (msg)
+            msg->Cancel();
+        emit MessageProcessed();
+        return;
+    }
+
     if (msg) {
         auto invoker = msg->GetInvoker();
         if (invoker) {
@@ -33,31 +56,31 @@ void Worker::OnDispatch(std::shared_ptr<dmq::DelegateMsg> msg) {
 #if defined(__cpp_exceptions) && !defined(DMQ_ASSERTS)
             try {
                 bool success = invoker->Invoke(msg);
-                ASSERT_TRUE(success);
+                DMQ_ASSERT_TRUE(success);
             }
             catch (const std::bad_alloc& e) {
                 qWarning() << "[Thread:" << m_thread->objectName() << "] Unhandled bad_alloc in delegate callback:" << e.what();
-                ASSERT();
+                DMQ_ASSERT();
             }
             catch (const std::invalid_argument& e) {
                 qWarning() << "[Thread:" << m_thread->objectName() << "] Unhandled invalid_argument in delegate callback:" << e.what();
-                ASSERT();
+                DMQ_ASSERT();
             }
             catch (const std::runtime_error& e) {
                 qWarning() << "[Thread:" << m_thread->objectName() << "] Unhandled runtime_error in delegate callback:" << e.what();
-                ASSERT();
+                DMQ_ASSERT();
             }
             catch (const std::exception& e) {
                 qWarning() << "[Thread:" << m_thread->objectName() << "] Unhandled exception in delegate callback:" << e.what();
-                ASSERT();
+                DMQ_ASSERT();
             }
             catch (...) {
                 qWarning() << "[Thread:" << m_thread->objectName() << "] Unhandled unknown exception in delegate callback.";
-                ASSERT();
+                DMQ_ASSERT();
             }
 #else
             bool success = invoker->Invoke(msg);
-            ASSERT_TRUE(success);
+            DMQ_ASSERT_TRUE(success);
 #endif
 #if defined(DMQ_DATABUS_TOOLS)
             if (m_thread) {
@@ -67,7 +90,47 @@ void Worker::OnDispatch(std::shared_ptr<dmq::DelegateMsg> msg) {
 #endif
         }
     }
+
+    // Any message restarts the idle countdown
+    if (m_idleTimer)
+        m_idleTimer->start();
+
     emit MessageProcessed();
+}
+
+//----------------------------------------------------------------------------
+// Worker::StartIdleTimer
+//----------------------------------------------------------------------------
+void Worker::StartIdleTimer(const dmq::UnicastDelegate<void()>& handler, dmq::Duration interval)
+{
+    m_idleHandler = handler;
+    auto ms = std::chrono::ceil<std::chrono::milliseconds>(interval).count();
+
+    m_idleTimer = new QTimer(this);
+    m_idleTimer->setSingleShot(true);
+    m_idleTimer->setInterval(ToTimerInterval(ms));
+    connect(m_idleTimer, &QTimer::timeout, this, [this]() {
+        m_idleHandler();
+        m_idleTimer->start();
+    });
+    m_idleTimer->start();
+}
+
+//----------------------------------------------------------------------------
+// Worker::StartHeartbeat
+//----------------------------------------------------------------------------
+void Worker::StartHeartbeat(dmq::Duration interval)
+{
+    auto ms = std::chrono::ceil<std::chrono::milliseconds>(interval).count();
+
+    m_heartbeatTimer = new QTimer(this);
+    m_heartbeatTimer->setInterval(ToTimerInterval(ms));
+    // Fires only while the event loop runs, so a stuck handler stops the heartbeat
+    connect(m_heartbeatTimer, &QTimer::timeout, this, [this]() {
+        if (m_thread)
+            m_thread->ThreadCheck();
+    });
+    m_heartbeatTimer->start();
 }
 
 //----------------------------------------------------------------------------
@@ -110,6 +173,14 @@ bool QtThread::CreateThread(std::optional<dmq::Duration> watchdogTimeout)
 {
     if (!m_thread)
     {
+        m_exiting.store(false);
+        // Held from creation, so the watchdog never sees a gated thread as hung
+        // before it reaches the gate (e.g. created before the scheduler runs)
+        m_startGate.OnCreate();
+        // Set before the thread exists: its loop reads the timeout before its
+        // first queue wait, and an idle thread waits forever with no timeout
+        m_lastAliveTime.store(Timer::GetNow());
+        m_watchdogTimeout.store(watchdogTimeout.value_or(dmq::Duration(0)));
         m_thread = new QThread();
         m_thread->setObjectName(QString::fromUtf8(m_threadName.c_str()));
 
@@ -130,17 +201,70 @@ bool QtThread::CreateThread(std::optional<dmq::Duration> watchdogTimeout)
 
         // Ensure worker is deleted when thread finishes
         connect(m_thread, &QThread::finished, m_worker, &QObject::deleteLater);
+
+        // Start handler and idle timer run on the new thread (started is emitted
+        // there; DirectConnection runs the lambda in place) before its event loop
+        // processes any dispatched message.
+        Worker* worker = m_worker;
+        QSemaphore* startSem = &m_startSem;
+        dmq::IThread* self = this;
+        QtThread* qt = this;    // start gate state; see the self-exit check below
+        connect(m_thread, &QThread::started, m_worker,
+            [worker, self, qt, startSem, startHandler = m_startHandler,
+             idleHandler = m_idleHandler, idleInterval = m_idleInterval,
+             watchdog = m_watchdogTimeout.load()]() {
+                worker->BeginCurrentScope(self);
+                if (startHandler)
+                    startHandler();
+                if (idleHandler)
+                    worker->StartIdleTimer(idleHandler, idleInterval);
+                if (watchdog.count() > 0)
+                    worker->StartHeartbeat(watchdog / dmq::WATCHDOG_HEARTBEAT_DIVISOR);
+
+                // A start handler that exited this thread (ExitThread() on itself)
+                // leaves right after the release below: once CreateThread() returns,
+                // the QtThread may be destroyed, so nothing after it may touch 'qt'.
+                const bool exitedInStart = qt->m_exiting.load();
+                startSem->release();
+                if (exitedInStart)
+                    return;
+
+                // Optional start gate: hold here, before the event loop runs any
+                // dispatched message, until it opens
+                if (qt->m_startGate.Enabled())
+                {
+                    const bool opened = qt->m_startGate.Wait(qt->m_exiting);
+                    qt->m_lastAliveTime.store(Timer::GetNow());   // before Passed()
+                    qt->m_startGate.Passed();
+                    // ExitThread() while held: the event loop cancels every
+                    // queued message (discard) up to the quit queued behind them
+                    if (!opened)
+                        worker->SetDiscard(true);
+                }
+            }, Qt::DirectConnection);
+
+        // Exit handler runs on the worker thread as it finishes (finished is
+        // emitted there), after GetCurrent() is cleared. Captured by copy so it
+        // works even if this QtThread was destroyed by a self-exit.
+        connect(m_thread, &QThread::finished, m_worker,
+            [worker, exitHandler = m_exitHandler]() {
+                worker->EndCurrentScope();
+                if (exitHandler)
+                    exitHandler();
+            }, Qt::DirectConnection);
         
         // Also delete the QThread object itself when finished (optional, depending on ownership)
         // connect(m_thread, &QThread::finished, m_thread, &QObject::deleteLater);
 
         m_thread->start();
 
+        // Wait for the start handler to complete
+        m_startSem.acquire();
+
         m_lastAliveTime.store(Timer::GetNow());
 
         if (watchdogTimeout.has_value())
         {
-            m_watchdogTimeout = watchdogTimeout.value();
 
             // Add to watchdog registry if not already present
             {
@@ -172,6 +296,9 @@ bool QtThread::CreateThread(std::optional<dmq::Duration> watchdogTimeout)
 //----------------------------------------------------------------------------
 void QtThread::WatchdogCheck()
 {
+    if (m_startGate.IsHeld())
+        return;     // held at its start gate by design, not hung
+
     auto now = Timer::GetNow();
     auto lastAlive = m_lastAliveTime.load();
     auto watchdogTimeout = m_watchdogTimeout.load();
@@ -229,23 +356,45 @@ dmq::RecursiveMutex& QtThread::GetWatchdogLock()
 //----------------------------------------------------------------------------
 // ExitThread
 //----------------------------------------------------------------------------
-void QtThread::ExitThread()
+void QtThread::ExitThread(ExitPolicy policy)
 {
     if (m_thread)
     {
-        m_thread->quit();
+        m_exiting.store(true);
+        const bool selfExit = (QThread::currentThread() == m_thread);
+        if (selfExit)
+            m_startGate.Leave();     // exited from its start handler: never reaches the gate
+
+        // A self-exit always discards: the event loop keeps running after this
+        // object may be destroyed.
+        m_worker->SetDiscard(policy == ExitPolicy::DISCARD || selfExit);
+
+        // A thread held at its start gate isn't waiting on its queue: wake it so it
+        // sees the exit flag (set above) and leaves. Never touches the gate itself,
+        // which may be destroyed once the thread is released.
+        m_startGate.Wake();
+
+        // Quit queued behind every message already dispatched, so DRAIN invokes
+        // them first and DISCARD cancels them first.
+        QThread* thread = m_thread;
+        QMetaObject::invokeMethod(m_worker, [thread]() { thread->quit(); }, Qt::QueuedConnection);
 
         // Wake any blocked threads
         m_mutex.lock();
         m_cvNotFull.wakeAll();
         m_mutex.unlock();
 
-        if (QThread::currentThread() != m_thread) {
+        if (!selfExit) {
             m_thread->wait();
             delete m_thread;
         } else {
             m_thread->deleteLater();
         }
+
+        // The thread has finished (or, on a self-exit, is in its last handler):
+        // stop watchdog checks. Not earlier, so a thread that hangs while
+        // ExitThread() waits for it is still reported.
+        m_watchdogTimeout.store(dmq::Duration(0));
 
         // Worker thread has fully stopped; null the back-pointer so the Worker
         // cannot access this Thread if it is kept alive by deleteLater.
@@ -292,14 +441,17 @@ void QtThread::Sleep(dmq::Duration timeout) {
 bool QtThread::DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg)
 {
     // Safety check: Don't emit if thread is tearing down
-    if (m_thread && m_thread->isRunning()) 
+    if (m_thread && m_thread->isRunning() && !m_exiting.load())
     {
         m_mutex.lock();
         if (m_queueSize >= m_maxQueueSize)
         {
             if (m_fullPolicy == FullPolicy::DROP)
             {
+                size_t depth = m_queueSize.load();
                 m_mutex.unlock();
+                if (m_droppedHandler)
+                    m_droppedHandler(depth);
                 return false; // silently discard
             }
 
@@ -307,7 +459,7 @@ bool QtThread::DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg)
             {
                 m_mutex.unlock();
                 printf("[Thread] CRITICAL: Queue full on thread '%s'! TRIGGERING FAULT.\n", m_threadName.c_str());
-                ASSERT_TRUE(m_queueSize < m_maxQueueSize);
+                DMQ_ASSERT_TRUE(m_queueSize < m_maxQueueSize);
                 return false;
             }
 
@@ -319,8 +471,11 @@ bool QtThread::DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg)
                 {
                     if (!m_cvNotFull.wait(&m_mutex, ms))
                     {
+                        size_t depth = m_queueSize.load();
                         m_mutex.unlock();
                         printf("[Thread] WARNING: Queue post timed out on '%s' — possible deadlock. Message dropped.\n", m_threadName.c_str());
+                        if (m_droppedHandler)
+                            m_droppedHandler(depth);
                         return false;
                     }
                 }
@@ -340,6 +495,12 @@ bool QtThread::DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg)
             m_dispatchCountAll++;
 #endif
 
+            // Unlike the other thread ports, msg->GetPriority() is ignored here:
+            // the queued signal goes into Qt's single FIFO event queue, so a
+            // Priority::HIGH message runs after every message dispatched before
+            // it. The other ports keep a HIGH and a NORMAL queue and drain HIGH
+            // first. Supporting priority would need a two-lane queue here, with
+            // the signal only waking the worker to drain it.
             emit SignalDispatch(msg);
             m_mutex.unlock();
             return true;
@@ -409,3 +570,5 @@ QtThread::ThreadStats QtThread::SnapshotStats()
 #endif
 
 } // namespace dmq::os
+
+#endif // DMQ_THREAD_QT

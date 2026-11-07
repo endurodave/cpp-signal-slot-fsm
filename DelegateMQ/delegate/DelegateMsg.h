@@ -28,10 +28,11 @@ namespace dmq {
 // the consumer draining the HIGH lane before the NORMAL lane:
 //   - StdlibThread / Win32Thread: two std::deque, one shared mutex+condition_variable.
 //   - ZephyrDelegateQueue:        two k_msgq,       drained via k_poll on both.
-//   - CmsisRtos2: native osMessageQueuePut msg_prio gives this directly (no dual lane needed).
-//   - FreeRTOSDelegateQueue / ThreadXDelegateQueue: two native queues, woken by
+//   - FreeRTOSDelegateQueue / ThreadXDelegateQueue / CmsisRtos2DelegateQueue: two native queues, woken by
 //     one shared counting semaphore "doorbell" (the RTOS-native stand-in for
-//     the stdlib condition_variable, since neither queue API exposes one).
+//     the stdlib condition_variable, since none of these queue APIs exposes one).
+//     CMSIS-RTOS2's osMessageQueuePut msg_prio is not used: implementations may
+//     ignore it (Zephyr's does).
 enum class Priority
 {
 	NORMAL,
@@ -58,6 +59,12 @@ public:
 	/// Get the delegate message priority
 	/// @return Delegate message priority
 	Priority GetPriority() const { return m_priority; }
+
+	/// @brief Called by a thread that discards this message without invoking it
+	/// (e.g. dmq::ExitPolicy::DISCARD). Releases a sender blocked waiting on the
+	/// invoke, which then sees the call as failed instead of waiting out its timeout.
+	/// No-op for messages nobody waits on.
+	virtual void Cancel() {}
 
 private:
 	/// The IThreadInvoker instance used to invoke the target function 

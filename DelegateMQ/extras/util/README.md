@@ -23,9 +23,9 @@ These classes provide transport-layer reliability (ACKs and Retries) over unreli
 * **`dmq::util::ReliableTransport.h`**: A composite transport that wraps a raw transport (e.g., UDP) and adds reliability logic transparently.
 
 ### 4. Networking Logic
-* **`dmq::util::NetworkEngine.h`**: A high-level manager that coordinates the `dmq::util::Dispatcher` and `ITransport` to simplify sending messages to remote endpoints.
 * **`dmq::util::NetworkConnect.h`**: Platform-specific socket initialization helpers (e.g., `dmq::util::NetworkContext`) to handle networking boilerplate like `WSAStartup`.
-* **`dmq::util::RemoteEndpoint.h`**: Base class for `dmq::DelegateMemberRemote` used to register receive-side endpoints with `dmq::util::NetworkEngine`.
+
+> **`RemoteDispatcher`/`RemoteEndpoint`** (the point-to-point RPC pattern) moved to [`extras/rpc`](../rpc/README.md). They still use this directory's `TransportMonitor`/`RetryMonitor`/`ReliableTransport` as shared reliability plumbing.
 
 ### 5. Monotonic Messaging and Time
 These utilities help handle message ordering and timestamping in distributed systems.
@@ -33,7 +33,7 @@ These utilities help handle message ordering and timestamping in distributed sys
 * **`dmq::util::MonotonicGuard.h`**: A generic template class to filter out-of-order or stale messages. Handles 32-bit rollover logic automatically and provides simple 64-bit monotonic checks.
 
 ### 6. System Utilities
-* **`dmq::util::Fault.h`**: Assertions and fault trapping macros (`ASSERT_TRUE`, `FAULT_Handler`) used throughout the library examples.
+* **`dmq::util::Fault.h`**: Assertions and fault trapping macros (`DMQ_ASSERT_TRUE`, `dmq::util::FaultHandler`) used throughout the library examples.
 * **`dmq::util::crc16.h`**: Checksum utility for data integrity in serial/UDP headers.
 
 ## Usage
@@ -44,9 +44,12 @@ Include these headers when you need specific functionality beyond basic delegate
 #include "extras/util/Timer.h"
 
 dmq::util::Timer myTimer;
-// Use a delegate to receive timer callbacks
-myTimer.OnExpired.Connect(dmq::MakeDelegate(&myClass, &MyClass::OnTimeout));
-myTimer.Start(1000); // 1-second periodic timer
+// Use a delegate to receive timer callbacks; store the connection or it disconnects immediately
+auto conn = myTimer.OnExpired.Connect(dmq::MakeDelegate(&myClass, &MyClass::OnTimeout));
+myTimer.Start(std::chrono::milliseconds(1000)); // 1-second periodic timer
+
+// Drive all timers periodically (main loop or high-priority task; an ISR only on bare metal)
+dmq::util::Timer::ProcessTimers();
 ```
 
 Or to invoke a function on a specific thread with a 5-second timeout:

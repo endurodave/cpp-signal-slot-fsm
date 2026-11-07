@@ -2,13 +2,31 @@
 
 The `dmq::databus::DataBus` is a central registry for topic-based communication within DelegateMQ. It provides a flexible publish-subscribe (Pub/Sub) architecture that decouples data producers from consumers.
 
+## DataBus vs. RemoteDispatcher — Data Distribution vs. Remote Function Invoke
+
+DelegateMQ has two distinct patterns for talking across threads/processes/machines. Picking the wrong one for the job shows up as awkward code, not a compile error, so it's worth knowing which is which before starting:
+
+| | **DataBus** (this directory) | **RemoteDispatcher** ([`extras/rpc`](../rpc/README.md)) |
+|---|---|---|
+| Pattern | Publish/subscribe (data distribution) | Point-to-point RPC (remote function invoke) |
+| Addressing | Topic string, many-to-many | Remote ID → one specific registered endpoint |
+| Who receives | Any number of subscribers (0, 1, or many) — the publisher doesn't know or care who | Exactly one endpoint per remote ID |
+| Call semantics | `Publish()` is always fire-and-forget from the caller's side; delivery outcome (if any) arrives later via signals (`OnPeerSendStatus`, `OnDeliveryFailed`) | `RemoteInvokeWait()` blocks the caller until the remote ACKs or times out, returning success/failure directly — plus a fire-and-forget mode too |
+| How you use it | Compose: hold an `ITransport&` (`Participant`), or instantiate `NetworkNode<Transport>` — no subclassing required | Compose: hold a `dmq::rpc::RemoteDispatcher` as a member (`NetworkMgr`), connect to its `OnError`/`OnStatus`/`OnDeliveryFailed` Signals — no subclassing required |
+| Reliability opt-in | Per-message — pass `Reliability::RELIABLE` or `UNRELIABLE` to `Send()` | Per-connection — the owning class decides once whether to wrap its transport in `ReliableTransport` |
+| Multi-peer topology | Built in — `NetworkNode` manages any number of peers | One connection per `RemoteDispatcher` instance; the app manages multiple peers itself if it needs more than one |
+| Typical use | Sensor data, telemetry, status broadcasts, state that should reach whoever's currently interested | Commands, remote function calls, request/response where the caller needs to know the call landed |
+
+**Rule of thumb:** if you're asking "who needs to know this happened?" reach for DataBus. If you're asking "did that specific call succeed?" reach for RemoteDispatcher.
+
 ## Quickstart
 
 Three steps to send data between components:
 
 **1. Define a message type**
 ```cpp
-// Any serializable struct — inherit MessageBase for built-in sequence numbers
+// Any serializable struct (the Cellutron/Pumptron examples derive from their own
+// MessageBase to add sequence numbers)
 struct TemperatureMsg : public serialize::I {
     float celsius = 0.0f;
     std::ostream& write(serialize& ms, std::ostream& os) override { return ms.write(os, celsius); }
@@ -40,7 +58,7 @@ To dispatch to a specific thread instead of the caller's thread:
 ```cpp
 auto conn = dmq::databus::DataBus::Subscribe<TemperatureMsg>(
     "sensor/temperature",
-    dmq::MakeDelegate(&MySensor::OnTemp, this),
+    dmq::MakeDelegate(this, &MySensor::OnTemp),
     &m_workerThread);   // callback executes on m_workerThread, not the publisher's thread
 ```
 
@@ -70,7 +88,7 @@ auto conn = dmq::databus::DataBus::Subscribe<int>("Temperature", [](const int& v
 
 // Subscription dispatched to a specific worker thread
 auto conn2 = dmq::databus::DataBus::Subscribe<int>("Temperature",
-    dmq::MakeDelegate(&MyClass::OnTempChange, &myObj), &workerThread);
+    dmq::MakeDelegate(&myObj, &MyClass::OnTempChange), &workerThread);
 ```
 
 ### Publishing to a Topic
@@ -155,8 +173,11 @@ void SetupNetwork() {
 - **Order-independent**: `Receive()` and `Send()` may be called before or after `Start()` / `AddPeer()`. Registrations are stored and applied retroactively.
 - **Reliability tiers**: `Reliability::UNRELIABLE` (default) sends raw UDP; `Reliability::RELIABLE` adds ACK + automatic retry via `RetryMonitor`.
 - **Transport-agnostic**: Pass any `ITransport`-derived type as the template argument — `Win32UdpTransport`, `LinuxUdpTransport`, `ZephyrUdpTransport`, etc.
+- **Local delivery by default**: a topic registered with `Receive()` reaches this node's subscribers only. Pass `Delivery::RELAY` (`Receive<T>(topic, id, ser, Delivery::RELAY)`) on a gateway node to also forward it out every other link that `Send()`s it. See [Relay Nodes](../../../../docs/DATABUS.md#relay-nodes).
 - **Fixed allocation**: `MaxPeers` and `MaxTopics` template parameters control pre-allocated capacity. No heap for transport objects (`RemoteNode` members are by-value in `std::array`).
+- **Participant budget**: each peer registers two participants with the DataBus (reliable and unreliable), and every link in the process draws from the same `dmq::MAX_PARTICIPANTS` (`DMQ_MAX_PARTICIPANTS`, default 8). The defaults already meet: 4 peers × 2 = 8. A process with more links needs a larger `DMQ_MAX_PARTICIPANTS`; going over reports `ERR_CAPACITY_EXCEEDED` and calls `FaultHandler`.
 - **`Participant` allocation**: Uses `xmake_shared` — fixed-block allocator on embedded targets.
+- **Error & status signals**: `OnDeliveryFailed(peerName, remoteId, seqNum)` fires once when a RELIABLE message exhausts its retry budget; `OnPeerSendStatus(peerName, remoteId, seqNum, status)` fires on every per-attempt outcome (SUCCESS or TIMEOUT) leading up to that, so an app can tell "still retrying" apart from "permanently abandoned"; `OnPeerCapExceeded`/`OnPeerPendingExceeded(peerName, count)` are backpressure health signals. None of these overlap `DataBus::SubscribeError` — see [Error & Status Reporting](../../../../docs/DATABUS.md#error--status-reporting) in the full DataBus doc for the complete picture (including `DelegateError` codes) and usage examples.
 
 ### Template parameters
 
@@ -168,6 +189,10 @@ class NetworkNode;
 ```
 
 `dmq::NETWORK_NODE_MAX_PEERS` (default 4) and `dmq::NETWORK_NODE_MAX_TOPICS` (default 16) come from `DMQ_NETWORK_NODE_MAX_PEERS` / `DMQ_NETWORK_NODE_MAX_TOPICS` in `DelegateMQConfig_Default.h` — override there to change the default for all instantiations, or pass explicit template arguments to override per-instantiation (e.g. `NetworkNode<Transport, 2, 8>`).
+
+---
+
+For the range of network topologies `NetworkNode` supports (star, mesh, broadcast/multicast, heterogeneous-transport gateways, broker-mediated, etc.), see [Topologies](../../../../docs/DATABUS.md#topologies) in the full DataBus doc.
 
 ---
 

@@ -21,8 +21,9 @@
 ///   dedicated worker loop.
 /// * **FullPolicy Support:** Configurable back-pressure (DROP or TIMEOUT) when the
 ///   message queue is full.
-/// * **Priority Support:** Normal and High priorities (High jumps the FIFO via
-///   `FreeRTOSDelegateQueue::Send`'s highPriority flag).
+/// * **Priority Support:** Normal and High priorities, as two FIFO queue lanes drained
+///   HIGH first, so same-priority messages keep dispatch order (see
+///   `FreeRTOSDelegateQueue` for why one queue + `xQueueSendToFront()` is wrong).
 /// * **Queue-Based Dispatch:** Uses `FreeRTOSDelegateQueue` (a thin RAII wrapper
 ///   around a FreeRTOS `QueueHandle_t`) to receive and process incoming delegate
 ///   messages in a thread-safe manner.
@@ -32,12 +33,17 @@
 ///   though typical embedded tasks often run forever.
 /// * **Watchdog Integration:** Optional heartbeat mechanism detects stalled or deadlocked
 ///   threads. Enable by passing a timeout to CreateThread(). Requires
-///   Timer::ProcessTimers() to be called from a context that can preempt watched threads
-///   — typically a hardware timer ISR or the highest-priority task in the system.
+///   Thread::WatchdogCheckAll() to be called periodically from a context that can preempt
+///   watched threads -- the highest-priority task in the system, not an ISR.
+/// * **Start Gate:** Optional `SetStartGate(StartGate*)`, called before `CreateThread()`,
+///   holds the thread ready but processing no messages, at any priority, until
+///   `StartGate::Open()` releases every thread sharing the gate at once.
 
 #include "delegate/IThread.h"
+#include "delegate/UnicastDelegate.h"
 #include "extras/util/Timer.h"
 #include "port/os/common/ThreadMsg.h"
+#include "port/os/common/StartGate.h"
 #include "FreeRTOSDelegateQueue.h"
 #include "FreeRTOS.h"
 #include "task.h"
@@ -56,6 +62,9 @@ namespace dmq::os {
 /// FAULT is the default. For embedded targets where the caller may be an ISR or
 /// high-priority task, consider DROP to avoid blocking at an unsafe context.
 using FullPolicy = dmq::FullPolicy;
+
+/// @brief What ExitThread() does with queued messages. See dmq::ExitPolicy in DelegateOpt.h.
+using ExitPolicy = dmq::ExitPolicy;
 
 class FreeRTOSThread : public dmq::IThread
 {
@@ -108,8 +117,12 @@ public:
     /// Returns true if the thread is created
     bool IsThreadCreated() const { return m_thread != nullptr; }
 
-    /// Terminate the thread gracefully
-    void ExitThread();
+    /// Shut down the worker thread.
+    /// @param[in] policy - DRAIN (default) invokes every message queued before this
+    ///   call first; DISCARD invokes only the message already running and cancels
+    ///   the rest (see dmq::ExitPolicy). Called from the thread's own message
+    ///   handler (a self-exit), queued messages are always discarded.
+    void ExitThread(ExitPolicy policy = ExitPolicy::DRAIN);
 
     /// Get the ID of this thread instance
     TaskHandle_t GetThreadId();
@@ -142,6 +155,67 @@ public:
 
     // IThread Interface Implementation
     virtual bool DispatchDelegate(std::shared_ptr<dmq::DelegateMsg> msg) override;
+
+    /// @brief Register a handler invoked when DispatchDelegate() drops a message:
+    /// under FullPolicy::DROP (queue full, discarded immediately) or
+    /// FullPolicy::TIMEOUT (queue stayed full for dispatchTimeout, discarded).
+    /// Optional; unset by default. Called synchronously on the calling (producer)
+    /// thread, with the queue depth at the time of the drop.
+    void SetDroppedHandler(const dmq::UnicastDelegate<void(size_t)>& handler) { m_droppedHandler = handler; }
+    void SetDroppedHandler(dmq::UnicastDelegate<void(size_t)>&& handler) { m_droppedHandler = std::move(handler); }
+
+    /// @brief Register a handler invoked on the worker thread before it processes
+    /// any message. Use it for per-thread setup (COM, a language runtime attach,
+    /// thread-local state, affinity). CreateThread() returns only after it completes.
+    /// @details Must be called while the thread is not running (before CreateThread(),
+    /// or after ExitThread()); calling it on a running thread faults. It runs again
+    /// on each CreateThread(). Messages dispatched meanwhile are queued, not lost.
+    void SetStartHandler(const dmq::UnicastDelegate<void()>& handler) { DMQ_ASSERT_TRUE(!IsThreadCreated()); m_startHandler = handler; }
+    void SetStartHandler(dmq::UnicastDelegate<void()>&& handler) { DMQ_ASSERT_TRUE(!IsThreadCreated()); m_startHandler = std::move(handler); }
+
+    /// @brief Optional: hold this thread at `gate` once it is created, until
+    /// `gate->Open()`. Pass nullptr (the default) to start at once.
+    /// @details CreateThread() still runs the start handler and returns when the
+    /// thread is ready; the thread then processes nothing, at any priority, until
+    /// the gate opens. Use one gate for a group of threads so they all start
+    /// together after setup. See port/os/common/StartGate.h. Must be called while
+    /// the thread is not running; calling it on a running thread faults.
+    void SetStartGate(StartGate* gate) { DMQ_ASSERT_TRUE(!IsThreadCreated()); m_startGate.Set(gate); }
+
+    /// @brief Register a handler invoked on the worker thread after it processes
+    /// its last message, as the thread exits. Use it to undo SetStartHandler() setup.
+    /// @details Must be called while the thread is not running; calling it on a
+    /// running thread faults. The handler is copied when the thread starts.
+    /// ExitThread() from another thread returns after it completes. If the thread
+    /// exits itself (ExitThread() from a handler on this thread), it runs after the
+    /// owning FreeRTOSThread may already be destroyed, so it must not touch that object.
+    void SetExitHandler(const dmq::UnicastDelegate<void()>& handler) { DMQ_ASSERT_TRUE(!IsThreadCreated()); m_exitHandler = handler; }
+    void SetExitHandler(dmq::UnicastDelegate<void()>&& handler) { DMQ_ASSERT_TRUE(!IsThreadCreated()); m_exitHandler = std::move(handler); }
+
+    /// @brief Register a handler invoked on the worker thread when its queue has
+    /// been empty for `interval`, then again every `interval` while it stays empty.
+    /// Any message processed restarts the countdown. Use it for background work that
+    /// should yield to messages: polling, housekeeping, entering low power.
+    /// @details Must be called while the thread is not running; calling it on a
+    /// running thread faults. The handler and interval are copied when the thread
+    /// starts. Not called once ExitThread() has been requested.
+    /// @param[in] handler - the idle handler, or an empty delegate to disable.
+    /// @param[in] interval - quiet time before each call. Must be greater than zero.
+    ///                       Defaults to dmq::THREAD_IDLE_INTERVAL (DMQ_THREAD_IDLE_INTERVAL).
+    void SetIdleHandler(const dmq::UnicastDelegate<void()>& handler, dmq::Duration interval = dmq::THREAD_IDLE_INTERVAL)
+    {
+        DMQ_ASSERT_TRUE(!IsThreadCreated());
+        DMQ_ASSERT_TRUE(interval > dmq::Duration::zero());
+        m_idleHandler = handler;
+        m_idleInterval = interval;
+    }
+    void SetIdleHandler(dmq::UnicastDelegate<void()>&& handler, dmq::Duration interval = dmq::THREAD_IDLE_INTERVAL)
+    {
+        DMQ_ASSERT_TRUE(!IsThreadCreated());
+        DMQ_ASSERT_TRUE(interval > dmq::Duration::zero());
+        m_idleHandler = std::move(handler);
+        m_idleInterval = interval;
+    }
 
     /// @brief Manually update the watchdog alive timestamp.
     /// @details The Run() loop refreshes the timestamp automatically on every iteration.
@@ -194,18 +268,34 @@ private:
 
     TaskHandle_t m_thread = nullptr;
     FreeRTOSDelegateQueue m_queue;
+
+    // Optional handler invoked when a message is dropped (FullPolicy::DROP or TIMEOUT)
+    dmq::UnicastDelegate<void(size_t)> m_droppedHandler;
+
+    // Optional handlers invoked on the worker thread at start, exit and when idle
+    dmq::UnicastDelegate<void()> m_startHandler;
+    dmq::UnicastDelegate<void()> m_exitHandler;
+    dmq::UnicastDelegate<void()> m_idleHandler;
+    dmq::Duration m_idleInterval = dmq::Duration::zero();
     SemaphoreHandle_t m_exitSem = nullptr; // Synchronization for safe destruction
+    SemaphoreHandle_t m_startSem = nullptr; // Given by Run() once the start handler has run
+    bool m_startSync = false; // CreateThread() waits for the start handler (scheduler running)
     std::atomic<bool> m_exit = false;
+    std::atomic<bool> m_discard = false; // ExitPolicy::DISCARD: cancel queued messages instead of invoking
     bool* m_selfExitPtr = nullptr;
 
     // Static allocation support
     StackType_t* m_stackBuffer = nullptr;
-    uint32_t m_stackSize = 4096; // Default size (words)
+    uint32_t m_stackSize = dmq::FREERTOS_STACK_WORDS; // Default size (words), see DMQ_FREERTOS_STACK_WORDS
     StaticTask_t m_tcb;          // TCB storage for static creation
 
     // Watchdog related members
     std::atomic<uint32_t> m_lastAliveTime{0};
     std::atomic<uint32_t> m_watchdogTimeout{0};
+
+    // Optional start gate (SetStartGate()): its state, and whether the thread is
+    // held at it (the watchdog doesn't report a thread waiting by design)
+    StartGateClient m_startGate;
     FreeRTOSThread* m_watchdogNext = nullptr;
 
 #if defined(DMQ_DATABUS_TOOLS)
